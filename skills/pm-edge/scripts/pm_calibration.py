@@ -17,6 +17,15 @@ from datetime import datetime, timezone
 DEFAULT = os.path.join(os.path.expanduser("~"), ".prediction-market", "ledger.jsonl")
 
 
+def _safe_ledger(path: str) -> str:
+    """Normalize and pin the ledger under the user's home directory."""
+    resolved = os.path.realpath(os.path.expanduser(path))
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not resolved.startswith(home + os.sep) and resolved != home:
+        raise ValueError(f"ledger must stay under the home directory: {resolved}")
+    return resolved
+
+
 def load(path: str):
     if not os.path.exists(path):
         return []
@@ -55,6 +64,7 @@ def main() -> int:
 
     sub.add_parser("score")
     args = ap.parse_args()
+    args.ledger = _safe_ledger(args.ledger)
 
     if args.cmd == "log":
         if not 0 <= args.p <= 1:
@@ -82,9 +92,10 @@ def main() -> int:
             return 2
         hit["outcome"] = args.outcome
         hit["resolved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with open(args.ledger, "w", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        import pathlib
+        pathlib.Path(args.ledger).write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+            encoding="utf-8")
         print(f"resolved {args.id} -> {args.outcome}")
         return 0
 

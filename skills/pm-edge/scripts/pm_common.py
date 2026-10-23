@@ -26,7 +26,26 @@ class FetchError(RuntimeError):
     pass
 
 
+def check_url(url: str) -> str:
+    """Scheme must be http(s); reject loopback, private, reserved, link-local hosts."""
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https"):
+        raise FetchError(f"non-http(s) scheme: {p.scheme}")
+    host = p.hostname or ""
+    if not host or host in ("localhost", "0.0.0.0") or host.endswith(".local"):
+        raise FetchError(f"rejected host: {host}")
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(host)
+        if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
+            raise FetchError(f"rejected address: {host}")
+    except ValueError:
+        pass  # hostname, not an IP — fine
+    return url
+
+
 def http_json(url: str, timeout: float = 35.0, attempts: int = 3):
+    check_url(url)
     last = None
     for attempt in range(attempts):
         req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})

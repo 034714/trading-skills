@@ -7,6 +7,7 @@ import json
 import math
 import re
 import sys
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -15,6 +16,17 @@ DERIBIT = "https://www.deribit.com/api/v2"
 
 
 def get(url):
+    # scheme/host check: only public https APIs, no loopback or private addresses
+    p = urllib.parse.urlparse(url)
+    if p.scheme != "https" or not p.hostname or p.hostname in ("localhost", "0.0.0.0"):
+        raise ValueError(f"rejected URL: {url}")
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(p.hostname)
+        if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
+            raise ValueError(f"rejected address: {p.hostname}")
+    except ValueError:
+        pass
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(request, timeout=35) as response:
         data = json.loads(response.read().decode("utf-8"))
