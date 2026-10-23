@@ -1,0 +1,4 @@
+{
+  "displayName": "Conditional Crypto Research",
+  "brief": "Read-only conditional trade cards using closed candles and tenor-bounded option candidates, without order execution."
+}
