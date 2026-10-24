@@ -14,6 +14,17 @@ shift by that model's trailing bias (obs - previous_day1), and read off the
 fraction of members inside the bracket. The reported p range is the min and max
 over 3 models x {raw, bias-shifted}, i.e. the least and most favourable reading.
 
+Every NO row also carries a drift check: the worst P(hit) if all members move
++/-0.5/1/1.5 deg toward the bracket. A NO whose edge evaporates under a 1 deg
+forecast miss is "fragile" and is filtered out by default (--risky shows it) --
+adjacent-to-centre brackets are where NO tickets go to die.
+
+`--settle YYYY-MM-DD` grades a finished date instead of scanning: actuals from
+IEM/HKO, the winning bracket, and the cached model centre's miss.
+
+Data pulls are batched per timezone group (Open-Meteo multi-location) and per
+6-station chunk (IEM), which is what makes a cold scan fast.
+
 Read-only. Prints a table; nothing is ordered.
 """
 from __future__ import annotations
@@ -29,6 +40,7 @@ import pathlib
 import re
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -42,9 +54,9 @@ from pm_common import UA, GAMMA, CLOB, KALSHI, http_json, as_float
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 os.makedirs(CACHE, exist_ok=True)
 LOCK = threading.Lock()
-# Open-Meteo starts returning 429 when a burst of parallel requests hits it; two
-# at a time is fast enough (the data is cached) and stays under the limit.
-_OM_SLOT = threading.Semaphore(2)
+# Open-Meteo allows 600 calls/min but 429s on bursts; batching cut the per-scan
+# call count to ~30, so 4 in flight is comfortably inside the limit.
+_OM_SLOT = threading.Semaphore(4)
 # IEM's ASOS archive tolerates more parallelism and is the bulk of the download.
 _IEM_SLOT = threading.Semaphore(6)
 
@@ -117,8 +129,17 @@ def cached(key: str, url: str, ttl_hours: float = 3.0):
                 return json.loads(p.read_text(encoding="utf-8"))
             except Exception:
                 pass
-    with _OM_SLOT:
-        data = http_json(_validate_url(url))
+    data = None
+    for attempt in range(3):
+        try:
+            with _OM_SLOT:
+                data = http_json(_validate_url(url))
+            break
+        except Exception as exc:
+            if "429" in str(exc) and attempt < 2:
+                time.sleep(2.0 * (attempt + 1))   # ensemble API bursts get throttled
+                continue
+            raise
     p.write_text(json.dumps(data), encoding="utf-8")
     return data
 
@@ -131,9 +152,18 @@ def cached_text(key: str, url: str, ttl_hours: float = 6.0, timeout: float = 120
             return p.read_text(encoding="utf-8")
     req = urllib.request.Request(_validate_url(url), headers={"User-Agent": UA})
     slot = _IEM_SLOT if "mesonet.agron" in url else _OM_SLOT
-    with slot:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            text = r.read().decode("utf-8", "replace")
+    text, last = None, None
+    for attempt in range(3):          # proxies hiccup; a dead fetch should not kill a scan
+        try:
+            with slot:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    text = r.read().decode("utf-8", "replace")
+            break
+        except Exception as exc:
+            last = exc
+            time.sleep(0.8 * (attempt + 1))
+    if text is None:
+        raise last
     p.write_text(text, encoding="utf-8")
     return text
 
@@ -409,15 +439,20 @@ def city_name(code: str) -> str:
     return CITY_CN.get(code) or CITY_CN.get(code + " ") or code
 
 
-def discover(target: date):
-    """All open weather events for the target local date, with station + brackets."""
+def discover(target: date, closed: bool = False):
+    """Weather events for the target local date (open by default, closed if asked)."""
     want = (target.month, target.day)
+    base = ("closed=true&active=false&order=id" if closed
+            else "active=true&closed=false&order=volume24hr")
+
+    def page(off):
+        return http_json(f"{GAMMA}/events?{base}&limit=100&offset={off}"
+                         "&ascending=false&tag_slug=weather")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        pages = [p for p in pool.map(page, range(0, 600, 100)) if p]
     events, seen = [], set()
-    for offset in range(0, 600, 100):
-        batch = http_json(f"{GAMMA}/events?active=true&closed=false&limit=100&offset={offset}"
-                          "&order=volume24hr&ascending=false&tag_slug=weather")
-        if not batch:
-            break
+    for batch in pages:
         for e in batch:
             title = e.get("title") or ""
             m = re.search(r"(january|february|march|april|may|june|july|august|september|october|"
@@ -453,6 +488,29 @@ _MONTHS = ("january", "february", "march", "april", "may", "june", "july", "augu
 
 # ---------------------------------------------------------------- Hong Kong
 
+def hko_extract_month(year: int, month: int, kind: str):
+    """Observatory Daily Extract via the website's own data file (updates with a
+    1-2 day lag even for the current month, unlike the CLMMAXT opendata feed
+    which stays empty until the month closes). Max temp is column 2, min col 4."""
+    text = cached_text(f"hkoext_{kind}_{year}_{month}",
+                       f"https://www.hko.gov.hk/cis/dailyExtract/dailyExtract_{year}{month:02d}.xml",
+                       ttl_hours=6)
+    out = {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return out
+    col = 2 if kind == "max" else 4
+    for block in (data.get("stn") or {}).get("data") or []:
+        for row in block.get("dayData") or []:
+            try:
+                d = date(year, int(block.get("month", month)), int(row[0]))
+                out[d] = float(row[col])
+            except (ValueError, TypeError, IndexError):
+                continue
+    return out
+
+
 def hko_month(kind: str, year: int, month: int):
     url = ("https://data.weather.gov.hk/weatherAPI/opendata/opendata.php"
            f"?dataType={kind}&year={year}&month={month}&rformat=csv&station=HKO")
@@ -468,6 +526,30 @@ def hko_month(kind: str, year: int, month: int):
     return out
 
 
+def _snap_fnd(fc: dict):
+    """Archive the day-ahead official max/min per target date. The accumulated
+    file eventually yields a real HKO-forecast error sigma to replace the
+    grid-residual proxy (HKO scores its own forecasts full marks within 1.5 C,
+    so a ~1 C official miss is ordinary and must not be treated as 5-sigma)."""
+    path = pathlib.Path(CACHE, "hko_fnd_history.jsonl")
+    have = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+                have.add((rec["issued"], rec["target"]))
+            except Exception:
+                pass
+    issued = datetime.now(ZoneInfo("Asia/Hong_Kong")).date().isoformat()
+    fresh = [{"issued": issued, "target": d.isoformat(), "max": mx, "min": mn}
+             for d, (mx, mn) in fc.items() if (issued, d.isoformat()) not in have]
+    if fresh:
+        with LOCK:
+            with open(path, "a", encoding="utf-8") as fh:
+                for rec in fresh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 def hk_model(target: date):
     """HKO official 9-day forecast as centre; grid->Observatory bias for the spread."""
     lat, lon, zone = 22.302, 114.174, "Asia/Hong_Kong"
@@ -480,12 +562,20 @@ def hk_model(target: date):
                 float(d["forecastMaxtemp"]["value"]), float(d["forecastMintemp"]["value"]))
         except (KeyError, ValueError):
             continue
+    try:
+        _snap_fnd(fc)
+    except Exception:
+        pass
 
     obs_max, obs_min = {}, {}
     for back in (0, 1, 2, 3):
         y, mth = (target.year, target.month - back) if target.month - back >= 1 else (target.year - 1, 12)
+        # CLMMAXT is empty for the open month; the Daily Extract file covers it
         obs_max.update({d: v for d, v in hko_month("CLMMAXT", y, mth).items()})
         obs_min.update({d: v for d, v in hko_month("CLMMINT", y, mth).items()})
+    for kind_key, acc in (("max", obs_max), ("min", obs_min)):
+        acc.update({d: v for d, v in hko_extract_month(target.year, target.month, kind_key).items()
+                    if d < target})
 
     out = {}
     for key, variable, obs in (("high", "temperature_2m_max", obs_max),
@@ -522,6 +612,19 @@ def prev_all_models(station: str, zone: str, start: date, end: date):
     key = (station, start, end)
     if key in _PREV_ALL:
         return _PREV_ALL[key]
+    pp = pathlib.Path(CACHE, f"prevparse_{station}_{start}_{end}.json")
+    if pp.exists() and (time.time() - pp.stat().st_mtime) < 3600 * 3:
+        try:
+            raw = json.loads(pp.read_text(encoding="utf-8"))
+            out = {}
+            for model, v in raw.items():
+                out[model] = {"max": {date.fromisoformat(d): x for d, x in v["max"].items()},
+                              "min": {date.fromisoformat(d): x for d, x in v["min"].items()}}
+            with LOCK:
+                _PREV_ALL[key] = out
+            return out
+        except Exception:
+            pass
     q = urllib.parse.urlencode({
         "latitude": STATIONS[station]["lat"], "longitude": STATIONS[station]["lon"],
         "hourly": "temperature_2m_previous_day1",
@@ -559,6 +662,14 @@ def members_all_models(station: str, zone: str, target: date, variable: str):
     key = (station, target, variable)
     if key in _MEM_ALL:
         return _MEM_ALL[key]
+    mp = pathlib.Path(CACHE, f"memparse_{station}_{target}_{variable}.json")
+    if mp.exists() and (time.time() - mp.stat().st_mtime) < 3600 * 3:
+        try:
+            with LOCK:
+                _MEM_ALL[key] = json.loads(mp.read_text(encoding="utf-8"))
+            return _MEM_ALL[key]
+        except Exception:
+            pass
     q = urllib.parse.urlencode({
         "latitude": STATIONS[station]["lat"], "longitude": STATIONS[station]["lon"],
         "daily": variable, "start_date": target.isoformat(), "end_date": target.isoformat(),
@@ -585,6 +696,130 @@ def members_all_models(station: str, zone: str, target: date, variable: str):
 
 
 _MEM_ALL: dict = {}
+
+# Open-Meteo accepts comma-separated coordinates and returns one dict per
+# location; the ensemble API additionally takes both daily variables at once.
+ENS_MODELS = "ecmwf_ifs025,gfs025,icon_seamless"
+MEMBER_TAGS = (("ecmwf_ifs025", "ecmwf"), ("gfs_seamless", "gefs"), ("icon_seamless", "icon"))
+
+
+def _split_members(daily: dict, variable: str) -> dict:
+    per = {m: [] for m in MODELS}
+    for k, series in (daily or {}).items():
+        if not k.startswith(variable) or not series or series[0] is None:
+            continue
+        for model, tag in MEMBER_TAGS:
+            if tag in k:
+                per[model].append(float(series[0]))
+                break
+    return per
+
+
+def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
+    """Pull everything the pricing pass needs in bulk, before the per-event pool.
+
+    previous_day1 and the ensembles go out as one multi-location request per
+    timezone group (the API takes a single timezone per call); IEM takes
+    comma-joined station lists in chunks of six. Everything lands in the memo
+    dicts and per-station cache files, so station_stats never touches the network
+    on a warm run.
+    """
+    codes = [c for c in dict.fromkeys(codes) if c != "HKO" and c in STATIONS]
+    groups: dict[str, list] = {}
+    for c in codes:
+        groups.setdefault(STATIONS[c]["tz"], []).append(c)
+
+    def prev_one(zone, sts):
+        q = urllib.parse.urlencode({
+            "latitude": ",".join(str(STATIONS[c]["lat"]) for c in sts),
+            "longitude": ",".join(str(STATIONS[c]["lon"]) for c in sts),
+            "hourly": "temperature_2m_previous_day1",
+            "start_date": obs_start.isoformat(), "end_date": obs_end.isoformat(),
+            "timezone": zone, "models": ",".join(MODELS),
+        })
+        data = cached(f"prevbatch_{zone}_{obs_start}_{obs_end}",
+                      f"https://previous-runs-api.open-meteo.com/v1/forecast?{q}")
+        for st, item in zip(sts, data if isinstance(data, list) else [data]):
+            h = item.get("hourly") or {}
+            times = h.get("time") or []
+            per = {}
+            for model in MODELS:
+                series = h.get(f"temperature_2m_previous_day1_{model}")
+                if not series:
+                    continue
+                hi, lo = {}, {}
+                for t, v in zip(times, series):
+                    if v is None:
+                        continue
+                    d = datetime.fromisoformat(t).date()
+                    hi[d] = max(hi.get(d, -999.0), float(v))
+                    lo[d] = min(lo.get(d, 999.0), float(v))
+                per[model] = {"max": hi, "min": lo}
+            if not per:
+                continue
+            with LOCK:
+                _PREV_ALL[(st, obs_start, obs_end)] = per
+            pathlib.Path(CACHE, f"prevparse_{st}_{obs_start}_{obs_end}.json").write_text(
+                json.dumps({m: {"max": {d.isoformat(): x for d, x in v["max"].items()},
+                                "min": {d.isoformat(): x for d, x in v["min"].items()}}
+                            for m, v in per.items()}), encoding="utf-8")
+
+    def ens_one(zone, sts):
+        q = urllib.parse.urlencode({
+            "latitude": ",".join(str(STATIONS[c]["lat"]) for c in sts),
+            "longitude": ",".join(str(STATIONS[c]["lon"]) for c in sts),
+            "daily": "temperature_2m_max,temperature_2m_min",
+            "start_date": target.isoformat(), "end_date": target.isoformat(),
+            "timezone": zone, "models": ENS_MODELS,
+        })
+        data = cached(f"ensbatch_{zone}_{target}",
+                      f"https://ensemble-api.open-meteo.com/v1/ensemble?{q}")
+        for st, item in zip(sts, data if isinstance(data, list) else [data]):
+            daily = item.get("daily") or {}
+            for variable in ("temperature_2m_max", "temperature_2m_min"):
+                per = _split_members(daily, variable)
+                if not any(per.values()):
+                    continue
+                with LOCK:
+                    _MEM_ALL[(st, target, variable)] = per
+                pathlib.Path(CACHE, f"memparse_{st}_{target}_{variable}.json").write_text(
+                    json.dumps(per), encoding="utf-8")
+
+    def iem_one(sts):
+        for i in range(0, len(sts), 6):
+            chunk = sts[i:i + 6]
+            url = ("https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?"
+                   f"station={','.join(chunk)}&data=tmpc,metar"
+                   f"&year1={obs_start.year}&month1={obs_start.month}&day1={obs_start.day}"
+                   f"&year2={obs_end.year}&month2={obs_end.month}&day2={obs_end.day}"
+                   "&tz=UTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no")
+            text = cached_text(f"iembatch_{'-'.join(chunk)}_{obs_start}_{obs_end}", url,
+                               ttl_hours=72)
+            rows = list(csv.reader(io.StringIO(text)))
+            if not rows or "station" not in rows[0]:
+                return  # unexpected shape; per-station fallback will fetch singly
+            si = rows[0].index("station")
+            out = {c: [",".join(rows[0])] for c in chunk}
+            for r in rows[1:]:
+                st = r[si].strip() if si < len(r) else ""
+                if st in out:
+                    out[st].append(",".join(r))
+            with LOCK:
+                for c, lines in out.items():
+                    pathlib.Path(CACHE, f"asos_{c}_{obs_start}_{obs_end}.csv").write_text(
+                        "\n".join(lines) + "\n", encoding="utf-8")
+
+    jobs = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for zone, sts in groups.items():
+            jobs.append(pool.submit(prev_one, zone, sts))
+            jobs.append(pool.submit(ens_one, zone, sts))
+        jobs.append(pool.submit(iem_one, codes))
+        for j in jobs:
+            try:
+                j.result()
+            except Exception as exc:
+                print(f"prewarm skip: {type(exc).__name__} {exc}", file=sys.stderr)
 
 
 def station_stats(code: str, kind: str, target: date, obs_start: date, obs_end: date):
@@ -645,8 +880,14 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
             lo, hi = bd
             ps = _norm_probs([centre], sigma, lo, hi, half_width=0.0)
             p = ps[0]
+            drift = 0.0
+            for s in (0.5, 1.0, 1.5):
+                drift = max(drift,
+                            _norm_probs([centre - s], sigma, lo, hi, half_width=0.0)[0],
+                            _norm_probs([centre + s], sigma, lo, hi, half_width=0.0)[0])
             rows.append(_row(ev, mk, p, p, p, None, None, centre=centre, sigma=sigma,
-                             note=f"天文台官方预报{centre:.0f}°C，误差±{sigma:.1f}", spread=0.0))
+                             note=f"天文台官方预报{centre:.0f}°C，误差±{sigma:.1f}", spread=0.0,
+                             p_drift=drift))
         return rows
 
     stats = station_stats(code, ev["kind"], target, obs_start, obs_end)
@@ -677,12 +918,21 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
         pr = {m: frac_in(v["raw"], lo, hi) for m, v in per_model.items()}
         pb = {m: frac_in(v["bias"], lo, hi) for m, v in per_model.items()}
         every = list(pr.values()) + list(pb.values())
+        # Drift check: the classic NO killer is a uniform ~1 deg forecast miss that
+        # lands the centre on (or next to) the bracket you sold. Worst case over
+        # +/-0.5/1/1.5 deg shifts, in market units (1.5 C = 2.7 F).
+        drift = 0.0
+        for s in (0.5 * factor, 1.0 * factor, 1.5 * factor):
+            for v in per_model.values():
+                drift = max(drift,
+                            frac_in([x - s for x in v["bias"]], lo, hi),
+                            frac_in([x + s for x in v["bias"]], lo, hi))
         rows.append(_row(ev, mk, min(every), median(every), max(every),
                          pr, pb, centre=median(centres), sigma=median(
                              v["sigma"] for v in per_model.values()),
                          note=f"三模式中心 {min(centres):.0f}-{max(centres):.0f}"
                               f"{ev['unit']}，分歧 {spread:.1f}",
-                         spread=spread))
+                         spread=spread, p_drift=drift))
     return rows
 
 
@@ -696,13 +946,13 @@ def _norm_probs(centres, sigma, lo, hi, half_width=0.5):
     return out
 
 
-def _row(ev, mk, pmin, pmean, pmax, pr, pb, centre, sigma, note="", spread=None):
+def _row(ev, mk, pmin, pmean, pmax, pr, pb, centre, sigma, note="", spread=None, p_drift=0.0):
     tokens = mk.get("clobTokenIds")
     tokens = json.loads(tokens) if isinstance(tokens, str) else (tokens or [])
     return {
         "code": ev["code"], "city": city_name(ev["code"]), "kind": ev["kind"], "unit": ev["unit"],
         "title": ev["title"], "label": mk.get("groupItemTitle"),
-        "p_min": pmin, "p_mean": pmean, "p_max": pmax,
+        "p_min": pmin, "p_mean": pmean, "p_max": pmax, "p_drift": p_drift,
         "bid": as_float(mk.get("bestBid")), "ask": as_float(mk.get("bestAsk")),
         "vol": as_float(mk.get("volume24hr")) or 0.0,
         "yes_token": tokens[0] if tokens else None,
@@ -734,39 +984,173 @@ def attach_books(rows, spend, workers=4):
 
 # ---------------------------------------------------------------- report
 
-def fmt_table(rows, spend, min_edge, mode, top, max_spread):
+KIND_CN = {"high": "最高温", "low": "最低温"}
+
+
+def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False):
     def ok(r):
         sp = r.get("spread")
         if sp is not None and sp > max_spread:
             return False
-        # 3x the order size inside 2c, otherwise the VWAP silently eats the edge
-        return max(r.get("yes_depth", 0), r.get("no_depth", 0)) >= 3 * spend
+        return True
 
     out = []
     if mode in ("yes", "both"):
-        cand = [r for r in rows if r.get("yes_vwap") and r["p_min"] - r["yes_vwap"] >= min_edge and ok(r)]
+        cand = [r for r in rows if r.get("yes_vwap") and r["p_min"] - r["yes_vwap"] >= min_edge
+                and ok(r) and r.get("yes_depth", 0) >= 3 * spend]
         cand.sort(key=lambda r: -(r["p_min"] - r["yes_vwap"]))
         out.append("## 买 YES｜花小钱赌这一档会中")
-        out.append("| 城市 | 档位 | 模型给的概率 | 实际买入价 | 便宜多少 | 盘口深度 | 依据 |")
-        out.append("|---|---|---|---|---|---|---|")
+        out.append("| 城市 | 市场 | 档位 | 模型给的概率 | 实际买入价 | 便宜多少 | 盘口深度 | 依据 |")
+        out.append("|---|---|---|---|---|---|---|---|")
         for r in cand[:top]:
-            out.append(f"| {r['city']} | {r['label']} | {r['p_min']:.0%}（乐观 {r['p_max']:.0%}） "
+            out.append(f"| {r['city']} | {KIND_CN[r['kind']]} | {r['label']} "
+                       f"| {r['p_min']:.0%}（乐观 {r['p_max']:.0%}） "
                        f"| {r['yes_vwap']:.3f} | +{(r['p_min']-r['yes_vwap'])*100:.0f}pp "
                        f"| ${r['yes_depth']:.0f} | {r['note']} |")
         out.append("")
     if mode in ("no", "both"):
-        cand = [r for r in rows if r.get("no_vwap") and (1 - r["p_max"]) - r["no_vwap"] >= min_edge and ok(r)]
+        cand, fragile = [], []
+        for r in rows:
+            if not (r.get("no_vwap") and (1 - r["p_max"]) - r["no_vwap"] >= min_edge
+                    and ok(r) and r.get("no_depth", 0) >= 3 * spend):
+                continue
+            # 抗漂移门槛：±1.5 度朝该档漂移后仍要剩 5pp 边际，否则这是
+            # "一次普通预报误差就翻车"的相邻档 NO
+            if (1 - r.get("p_drift", 0.0)) - r["no_vwap"] < 0.05:
+                fragile.append(r)
+            else:
+                cand.append(r)
         cand.sort(key=lambda r: -((1 - r["p_max"]) - r["no_vwap"]))
         out.append("## 买 NO｜高胜率，赌这一档不会中")
-        out.append("| 城市 | 档位 | 模型给的胜率 | 买入价 | 赔率 | 便宜多少 | 盘口深度 | 依据 |")
-        out.append("|---|---|---|---|---|---|---|---|")
-        for r in cand[:top]:
+        out.append("| 城市 | 市场 | 档位 | 模型给的胜率 | 买入价 | 赔率 | 便宜多少 | 抗漂移胜率 | 盘口深度 | 依据 |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|")
+        shown = cand[:top]
+        if risky:
+            shown = shown + fragile[:max(0, top - len(shown))]
+        for r in shown:
             no_v = r["no_vwap"]
-            out.append(f"| {r['city']} | {r['label']} | {1-r['p_max']:.0%}（保守 {1-r['p_min']:.0%}） "
+            mark = " ⚠️脆弱" if r in fragile else ""
+            out.append(f"| {r['city']} | {KIND_CN[r['kind']]} | {r['label']}{mark} "
+                       f"| {1-r['p_max']:.0%}（保守 {1-r['p_min']:.0%}） "
                        f"| {no_v:.3f} | {(1-no_v)/no_v:.2f}:1 | +{((1-r['p_max'])-no_v)*100:.0f}pp "
-                       f"| ${r['no_depth']:.0f} | {r['note']} |")
+                       f"| {1-r.get('p_drift',0):.0%} | ${r['no_depth']:.0f} | {r['note']} |")
+        if fragile:
+            out.append(f"\n已过滤 {len(fragile)} 个漂移脆弱档（模型概率够，但 ±1.5°C 漂移就翻车"
+                       f"——10/24 华沙 6°、亚特兰大 70-71° 都是这类）。加 --risky 查看。")
         out.append("")
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------- settle
+
+def settle_daily(station: str, zone: str, day: date):
+    """Routine-METAR extremes for one local day, no completeness gate (grading only)."""
+    prev_d, next_d = day - timedelta(days=1), day + timedelta(days=1)
+    url = ("https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?"
+           f"station={station}&data=tmpc,metar"
+           f"&year1={prev_d.year}&month1={prev_d.month}&day1={prev_d.day}"
+           f"&year2={next_d.year}&month2={next_d.month}&day2={next_d.day}"
+           "&tz=UTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no")
+    text = cached_text(f"settle_{station}_{day}", url, ttl_hours=24)
+    tz, us = ZoneInfo(zone), station.startswith("K")
+    hi, lo, seen = -99.0, 99.0, set()
+    for row in csv.DictReader(io.StringIO(text)):
+        rep, stamp = (row.get("metar") or "").strip(), (row.get("valid") or "").strip()
+        if not rep or not stamp or rep in seen:
+            continue
+        seen.add(rep)
+        if not is_routine(rep, us):
+            continue
+        t = metar_temp(rep)
+        if t is None:
+            continue
+        try:
+            utc = datetime.strptime(stamp, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("UTC"))
+        except ValueError:
+            continue
+        if utc.astimezone(tz).date() != day:
+            continue
+        hi, lo = max(hi, t), min(lo, t)
+    return (hi if hi > -50 else None, lo if lo < 50 else None)
+
+
+def _winner_label(ev, v: float, hk: bool):
+    """Bracket containing the settled value: floor rule for HK, round-half-up elsewhere."""
+    r = math.floor(v) if hk else math.floor(v + 0.5)
+    for m in ev["markets"]:
+        lab = m.get("groupItemTitle") or ""
+        bd = hk_interval(lab) if hk else bounds(lab)
+        if not bd:
+            continue
+        lo, hi = bd
+        if hk:
+            # hk_interval already widened the upper edge: the reading is in [lo, hi)
+            if (lo is None or v >= lo) and (hi is None or v < hi):
+                return lab
+        else:
+            # round-half-up ladders: middle brackets are lo<=r<=hi, tails are
+            # "X or below" (r<=hi) and "X or higher" (r>=lo)
+            if (lo is None or r >= lo) and (hi is None or r <= hi):
+                return lab
+    return f"{v:.1f}（未匹配到档位）"
+
+
+def _cached_centre(code, kind, target, obs_start, obs_end, unit):
+    """Model centre from the scan-time stats cache, any age (grading only)."""
+    tag = hashlib.sha256(f"{code}|{kind}|{target}|{obs_start}|{obs_end}".encode()).hexdigest()[:24]
+    p = pathlib.Path(CACHE, "stats_" + tag + ".json")
+    if not p.exists():
+        return None
+    try:
+        stats = json.loads(p.read_text(encoding="utf-8"))
+        cs = [sorted(v["members"])[len(v["members"]) // 2] + v["bias"]
+              for v in stats["per_model"].values() if v.get("members")]
+        if not cs:
+            return None
+        c = median(cs)
+        return c * (9 / 5 if unit == "F" else 1.0) + (32.0 if unit == "F" else 0.0)
+    except Exception:
+        return None
+
+
+def settle(target: date) -> int:
+    """Grade a finished date: actuals, winning bracket, and the model centre's miss."""
+    merged, ids = [], set()
+    for ev in discover(target) + discover(target, closed=True):
+        if ev["id"] not in ids:
+            ids.add(ev["id"])
+            merged.append(ev)
+    events = merged
+    print(f"# {target} 结算核对（{len(events)} 个事件）\n")
+    print("| 城市 | 市场 | 实际 | 获胜档 | 模型中心（缓存） | 偏差 |")
+    print("|---|---|---|---|---|---|")
+    obs_end = target - timedelta(days=1)
+    obs_start = obs_end - timedelta(days=64)
+    for ev in sorted(events, key=lambda e: -e.get("vol") or 0):
+        code, kind = ev["code"], ev["kind"]
+        if code == "HKO":
+            kind_key = "CLMMAXT" if kind == "high" else "CLMMINT"
+            col = "max" if kind == "high" else "min"
+            v = (hko_extract_month(target.year, target.month, col).get(target)
+                 or hko_month(kind_key, target.year, target.month).get(target))
+            if v is None:
+                print(f"| 香港 | {KIND_CN[kind]} | 天文台摘录未发布（滞后1-2天） | - | - | - |")
+                continue
+            winner, unit = _winner_label(ev, v, hk=True), "°C"
+        else:
+            hi, lo = settle_daily(code, STATIONS[code]["tz"], target)
+            v = hi if kind == "high" else lo
+            if v is None:
+                print(f"| {city_name(code)} | {KIND_CN[kind]} | 无观测数据 | - | - | - |")
+                continue
+            if ev["unit"] == "F":          # METAR obs are Celsius; the ladder is Fahrenheit
+                v = v * 9 / 5 + 32
+            winner, unit = _winner_label(ev, v, hk=False), ("°F" if ev["unit"] == "F" else "°C")
+        centre = _cached_centre(code, kind, target, obs_start, obs_end, ev["unit"])
+        miss = f"{v - centre:+.1f}" if centre is not None else "-"
+        c_txt = f"{centre:.1f}" if centre is not None else "-"
+        print(f"| {city_name(code)} | {KIND_CN[kind]} | {v:.1f}{unit} | {winner} | {c_txt} | {miss} |")
+    return 0
 
 
 def main() -> int:
@@ -783,11 +1167,18 @@ def main() -> int:
                     help="Reject brackets where the three model centres disagree by more than this (C or F).")
     ap.add_argument("--lookback", type=int, default=64, help="Days of history for bias/sigma.")
     ap.add_argument("--workers", type=int, default=4, help="Parallel stations (Open-Meteo rate limit).")
+    ap.add_argument("--settle", default="",
+                    help="Grade a finished date (YYYY-MM-DD) instead of scanning: actuals, "
+                         "winning bracket, cached model centre.")
+    ap.add_argument("--risky", action="store_true",
+                    help="NO 表附带漂移脆弱档（默认过滤掉 ±1.5°C 就翻车的相邻档）。")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     target = (date.fromisoformat(args.date) if args.date
               else datetime.now(ZoneInfo("UTC")).date() + timedelta(days=1))
+    if args.settle:
+        return settle(date.fromisoformat(args.settle))
     obs_end = target - timedelta(days=1)
     obs_start = obs_end - timedelta(days=args.lookback)
 
@@ -801,6 +1192,10 @@ def main() -> int:
         print(f"no open temperature markets for {target}")
         return 1
     print(f"{target} | {len(events)} events", file=sys.stderr)
+
+    t0 = time.time()
+    prewarm([ev["code"] for ev in events], target, obs_start, obs_end, workers=args.workers)
+    print(f"prewarm {time.time() - t0:.1f}s", file=sys.stderr)
 
     rows = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -829,7 +1224,8 @@ def main() -> int:
         return 0
 
     print(f"\n# {target} 天气盘扫描  (${args.spend:.0f} 单量, 边际门槛 {args.min_edge*100:.0f}pp)\n")
-    table = fmt_table(shortlist, args.spend, args.min_edge, args.mode, args.top, args.max_spread)
+    table = fmt_table(shortlist, args.spend, args.min_edge, args.mode, args.top,
+                      args.max_spread, risky=args.risky)
     print(table if table.strip() else "没有过门槛的档位。")
     return 0
 
