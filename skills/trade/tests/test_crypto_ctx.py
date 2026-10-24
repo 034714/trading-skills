@@ -2,7 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -22,13 +22,19 @@ class RegressionTests(unittest.TestCase):
             code = ctx.main(argv)
         return code, out.getvalue(), err.getvalue()
 
-    def candles(self, interval, count):
+    def candles(self, interval, count, closes=None):
         step = 86400000 if interval == "1d" else 14400000
         end = int(datetime.now(timezone.utc).timestamp() * 1000) // step * step - 1
-        return [{"open_time": end - step * (count-i) + 1,
-                 "close_time": end - step * (count-i-1),
-                 "open": 100., "high": 101., "low": 99., "close": 100., "volume": 1.}
-                for i in range(count)]
+        rows = []
+        for i in range(count):
+            close = closes[i] if closes else 100.0
+            prev = closes[i - 1] if closes and i > 0 else 100.0
+            high = max(prev, close) + 1.0
+            low = min(prev, close) - 1.0
+            rows.append({"open_time": end - step * (count - i) + 1,
+                         "close_time": end - step * (count - i - 1),
+                         "open": prev, "high": high, "low": low, "close": close, "volume": 1.0})
+        return rows
 
     def history(self, pair, interval, limit=300, **kwargs):
         return self.candles(interval, 240 if interval == "1d" else 100)
@@ -41,6 +47,42 @@ class RegressionTests(unittest.TestCase):
     def test_flat_rsi_and_vol(self):
         self.assertEqual(ctx.rsi([100] * 40), 50)
         self.assertEqual(ctx.realized_vol([100] * 40), 0)
+
+    def test_sig_rounding(self):
+        self.assertEqual(ctx.sig(81189.432123456), 81189.4)
+        self.assertEqual(ctx.sig(0.021750123, 4), 0.02175)
+        self.assertEqual(ctx.sig(0), 0.0)
+        self.assertIsNone(ctx.sig(None))
+
+    def test_symbol_parsing_and_limits(self):
+        args = self.args("--symbols", "btc, eth,BTC")
+        ctx.validate(args)
+        self.assertEqual(args.symbol_list, ["BTC", "ETH"])
+        args = self.args("--symbol", "sol")
+        ctx.validate(args)
+        self.assertEqual(args.symbol_list, ["SOL"])
+        with self.assertRaises(ValueError):
+            ctx.validate(self.args("--symbols", "BTC,ETH,SOL,BNB,XRP"))
+        with self.assertRaises(ValueError):
+            ctx.validate(self.args("--symbol", "BTC", "--symbols", "SOL"))
+
+    def test_ladder_levels(self):
+        self.assertEqual(ctx.ladder_levels("long", 100, 90, 3, 4), [100, 98, 96])
+        self.assertEqual(ctx.ladder_levels("short", 100, 110, 3, 4), [100, 102, 104])
+        self.assertEqual(ctx.ladder_levels("long", 100, 85, 3, 40), [100])
+        self.assertEqual(ctx.ladder_levels("long", 100, 90, 1, 4), [100])
+
+    def test_card_ladder_math(self):
+        args = self.args("--bias", "long", "--entry", "100", "--stop", "90")
+        card = ctx.conditional_card(args, atr_value=4)
+        self.assertEqual(card["tranche_ladder"]["levels"], [100.0, 98.0, 96.0])
+        self.assertEqual(card["tranche_ladder"]["avg_entry"], 98.0)
+        self.assertEqual(card["gross_R_targets"]["1"], 106.0)
+        self.assertEqual(card["units_per_100_usd_risk_example"], 12.5)
+        card = ctx.conditional_card(self.args("--bias", "long", "--entry", "100", "--stop", "90",
+                                              "--tranches", "1"), atr_value=4)
+        self.assertNotIn("tranche_ladder", card)
+        self.assertEqual(card["gross_R_targets"]["1"], 110.0)
 
     def test_unknown_budget_no_size(self):
         card = ctx.conditional_card(self.args("--bias", "long", "--entry", "100", "--stop", "90"))
@@ -66,7 +108,9 @@ class RegressionTests(unittest.TestCase):
                  ["--stop", "inf"], ["--min-days", "20", "--max-days", "10"],
                  ["--bias", "long"], ["--bias", "short", "--entry", "100", "--stop", "90"],
                  ["--bias", "neutral", "--entry", "0"], ["--auto", "--bias", "long"],
-                 ["--expiry-hint", "invalid"], ["--unknown"], ["--equity", "bad"]]
+                 ["--expiry-hint", "invalid"], ["--unknown"], ["--equity", "bad"],
+                 ["--tranches", "0"], ["--tranches", "6"], ["--symbols", ""],
+                 ["--symbols", "BT-C"], ["--scan-list", "X"]]
         with patch.object(ctx, "get", side_effect=AssertionError("network must not run")):
             for flags in cases:
                 with self.subTest(flags=flags):
@@ -96,16 +140,25 @@ class RegressionTests(unittest.TestCase):
         self.assertIsNone(row["mid_valuation_only"])
         self.assertFalse(row["specification_verified"])
 
-    def test_json_includes_card_without_auto_noise(self):
-        with patch.object(ctx, "klines", side_effect=self.history), patch.object(ctx, "option_chain", return_value=[]):
+    def test_json_envelope_two_symbols_and_auto_card(self):
+        with patch.object(ctx, "klines", side_effect=self.history), \
+             patch.object(ctx, "option_chain", return_value=[]), \
+             patch.object(ctx, "fetch_live", return_value={}):
             for flags in (["--auto"], ["--bias", "neutral"], ["--bias", "long", "--entry", "100", "--stop", "90"]):
                 code, out, err = self.invoke(flags + ["--json"])
                 self.assertEqual(code, 0)
                 report = json.loads(out)
-                self.assertIn("conditional_order_card", report)
-                self.assertEqual(report["option_candidates"], [])
+                self.assertEqual(report["schema"], "trade_ctx_v2")
+                self.assertEqual([s["symbol"] for s in report["symbols"]], ["BTC", "ETH"])
+                self.assertNotIn("\n", out.strip())
+                for sym in report["symbols"]:
+                    card = sym["conditional_order_card"]
+                    self.assertIn("conditional_order_card", sym)
+                    self.assertEqual(sym["option_candidates"], [])
+                    self.assertIn("live_snapshot", sym)
+                    self.assertIn("options_fit_note", sym)
                 if flags == ["--auto"]:
-                    card = report["conditional_order_card"]
+                    card = report["symbols"][0]["conditional_order_card"]
                     self.assertEqual(card["entry"], 100)
                     self.assertAlmostEqual(card["stop_trigger"], 97.4)
                     self.assertEqual(card["bias"], "long")
@@ -114,23 +167,68 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(err, "")
 
     def test_text_starts_with_card(self):
-        with patch.object(ctx, "klines", side_effect=self.history), patch.object(ctx, "option_chain", return_value=[]):
+        with patch.object(ctx, "klines", side_effect=self.history), \
+             patch.object(ctx, "option_chain", return_value=[]), \
+             patch.object(ctx, "fetch_live", return_value={}):
             code, out, err = self.invoke([])
             self.assertEqual(code, 0)
             self.assertTrue(out.startswith("条件挂单卡"))
 
-    def test_option_failure_and_explicit_expiry_failure(self):
-        with patch.object(ctx, "klines", side_effect=self.history), patch.object(ctx, "option_chain", side_effect=ValueError("offline")):
+    def test_live_snapshot_degrades_gracefully(self):
+        with patch.object(ctx, "get", side_effect=OSError("offline")):
+            live = ctx.fetch_live("BTCUSDT")
+        self.assertEqual(set(live.get("unavailable", [])),
+                         {"spot", "ticker_24h", "premium", "open_interest", "oi_hist", "lsr"})
+        self.assertNotIn("spot", live)
+
+    def test_scan_rows_descriptive(self):
+        rising = self.candles("1d", 240, closes=[100.0 + i for i in range(240)])
+        with patch.object(ctx, "klines", return_value=rising), \
+             patch.object(ctx, "get", return_value={"lastFundingRate": "0.001"}):
+            row = ctx.fetch_scan_row("SOL")
+        self.assertEqual(row["symbol"], "SOL")
+        for flag in ("RSI>=70", "贴近90日高点", "均线多头排列", "正资金费率偏高"):
+            self.assertIn(flag, row["flags"])
+        self.assertEqual(row["funding_8h"], 0.001)
+        self.assertEqual(row["ema_stack"], "bull")
+
+    def test_scan_row_marks_insufficient_history(self):
+        with patch.object(ctx, "klines", return_value=self.candles("1d", 100)), \
+             patch.object(ctx, "get", side_effect=OSError("offline")):
+            row = ctx.fetch_scan_row("DOGE")
+        self.assertIn("note", row)
+
+    def test_partial_symbol_failure_still_outputs(self):
+        def klines_fail_eth(pair, interval, limit=300, **kwargs):
+            if pair == "ETHUSDT":
+                raise OSError("eth down")
+            return self.history(pair, interval, limit)
+
+        with patch.object(ctx, "klines", side_effect=klines_fail_eth), \
+             patch.object(ctx, "option_chain", return_value=[]), \
+             patch.object(ctx, "fetch_live", return_value={}):
             code, out, _ = self.invoke(["--json"])
             self.assertEqual(code, 0)
-            self.assertEqual(json.loads(out)["options_status"], "unavailable")
+            report = json.loads(out)
+            self.assertEqual(report["partial_failures"], ["ETH"])
+            self.assertEqual(report["symbols"][1]["symbol"], "ETH")
+            self.assertIn("error", report["symbols"][1])
+
+    def test_option_failure_and_explicit_expiry_failure(self):
+        with patch.object(ctx, "klines", side_effect=self.history), \
+             patch.object(ctx, "option_chain", side_effect=ValueError("offline")), \
+             patch.object(ctx, "fetch_live", return_value={}):
+            code, out, _ = self.invoke(["--json"])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out)["symbols"][0]["options_status"], "unavailable")
             code, out, _ = self.invoke(["--json", "--expiry-hint", "10JAN30"])
             self.assertEqual(code, 2)
             self.assertIn("explicit expiry", json.loads(out)["error"])
 
     def test_network_and_insufficient_history_errors(self):
         for side_effect, return_value in ((OSError("offline"), None), (None, [])):
-            with patch.object(ctx, "klines", side_effect=side_effect, return_value=return_value):
+            with patch.object(ctx, "klines", side_effect=side_effect, return_value=return_value), \
+                 patch.object(ctx, "fetch_live", return_value={}):
                 code, out, _ = self.invoke(["--json"])
                 self.assertEqual(code, 2)
                 self.assertEqual(json.loads(out)["status"], "no_plan")
@@ -144,7 +242,8 @@ class RegressionTests(unittest.TestCase):
                     row["close_time"] -= 864000000
             else:
                 rows[20]["open_time"] += 1
-            with patch.object(ctx, "klines", return_value=rows):
+            with patch.object(ctx, "klines", return_value=rows), \
+                 patch.object(ctx, "fetch_live", return_value={}):
                 code, out, _ = self.invoke(["--json"])
                 self.assertEqual(code, 2)
 

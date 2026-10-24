@@ -1,4 +1,4 @@
 {
   "displayName": "Conditional Crypto Research",
-  "brief": "Read-only conditional trade cards using closed candles and tenor-bounded option candidates, without order execution."
+  "brief": "One command covers BTC+ETH by default: closed-candle indicators, live/funding/OI/long-short snapshot, option candidates and an altcoin screen; conditional cards first (with tranche ladder and options-fit notes), read-only, no orders."
 }
