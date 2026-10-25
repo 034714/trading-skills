@@ -20,7 +20,13 @@ forecast miss is "fragile" and is filtered out by default (--risky shows it) --
 adjacent-to-centre brackets are where NO tickets go to die.
 
 `--settle YYYY-MM-DD` grades a finished date instead of scanning: actuals from
-IEM/HKO, the winning bracket, and the cached model centre's miss.
+IEM/HKO, the winning bracket, and the cached model centre's miss. Every graded
+row is written to .cache/settle_history.jsonl (re-running a date replaces its
+rows), so calibration evidence accumulates for free.
+
+`--bias` replays that history: per-city mean miss and scatter of the model
+centre vs the settled actual, plus the centre bracket's hit rate -- the numbers
+that say how far a NO must sit from centre to be really safe.
 
 Data pulls are batched per timezone group (Open-Meteo multi-location) and per
 6-station chunk (IEM), which is what makes a cold scan fast.
@@ -130,13 +136,13 @@ def cached(key: str, url: str, ttl_hours: float = 3.0):
             except Exception:
                 pass
     data = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             with _OM_SLOT:
                 data = http_json(_validate_url(url))
             break
         except Exception as exc:
-            if "429" in str(exc) and attempt < 2:
+            if "429" in str(exc) and attempt < 3:
                 time.sleep(2.0 * (attempt + 1))   # ensemble API bursts get throttled
                 continue
             raise
@@ -809,17 +815,55 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
                     pathlib.Path(CACHE, f"asos_{c}_{obs_start}_{obs_end}.csv").write_text(
                         "\n".join(lines) + "\n", encoding="utf-8")
 
-    jobs = []
+    def guarded(fn, label, sts, cache_ok):
+        try:
+            fn()
+            return None
+        except Exception as exc:
+            print(f"prewarm {label} 首次失败（{type(exc).__name__}），稍后重试", file=sys.stderr)
+            return (fn, label, sts, cache_ok)
+
+    def have_prev(sts):
+        return all(pathlib.Path(CACHE, f"prevparse_{st}_{obs_start}_{obs_end}.json").exists()
+                   for st in sts)
+
+    def have_ens(sts):
+        return all(pathlib.Path(CACHE, f"memparse_{st}_{target}_{v}.json").exists()
+                   for st in sts
+                   for v in ("temperature_2m_max", "temperature_2m_min"))
+
+    def have_iem(sts):
+        return all(pathlib.Path(CACHE, f"asos_{st}_{obs_start}_{obs_end}.csv").exists()
+                   for st in sts)
+
+    failed = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
+        jobs = []
         for zone, sts in groups.items():
-            jobs.append(pool.submit(prev_one, zone, sts))
-            jobs.append(pool.submit(ens_one, zone, sts))
-        jobs.append(pool.submit(iem_one, codes))
-        for j in jobs:
-            try:
-                j.result()
-            except Exception as exc:
-                print(f"prewarm skip: {type(exc).__name__} {exc}", file=sys.stderr)
+            jobs.append(pool.submit(guarded, prev_one, "前一天预报", sts, have_prev))
+            jobs.append(pool.submit(guarded, ens_one, "集合成员", sts, have_ens))
+        jobs.append(pool.submit(guarded, iem_one, "IEM 观测", codes, have_iem))
+        failed = [r for r in (j.result() for j in jobs) if r]
+
+    # 429 限流兜底：歇一口气，用更低的并发把失败的组重来一次
+    if failed:
+        time.sleep(20.0)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            second = [pool.submit(guarded, fn, label, sts, cache_ok)
+                      for fn, label, sts, cache_ok in failed]
+            failed = [r for r in (j.result() for j in second) if r]
+
+    # 仍失败时按"盘面是否已有缓存"分级提示：有缓存=数据旧一点但结论还作数；
+    # 没缓存才真正不可靠（静默降级会让概率算在残缺数据上，10-25 曾有 4 个时区
+    # 被限流跳过、候选表悄悄少了一半，就是这里没兜住）
+    for fn, label, sts, cache_ok in failed:
+        names = "、".join(city_name(s) for s in sts)
+        if cache_ok(sts):
+            print(f"prewarm {label} 拉取失败（{names}）：沿用上次缓存，数据可能不是最新",
+                  file=sys.stderr)
+        else:
+            print(f"⚠ prewarm 重试后仍失败: {label} — {names}；这些城市本次数据不全，"
+                  f"概率不可靠，请稍后重跑同一命令（缓存会续上）", file=sys.stderr)
 
 
 def station_stats(code: str, kind: str, target: date, obs_start: date, obs_end: date):
@@ -861,6 +905,23 @@ def station_stats(code: str, kind: str, target: date, obs_start: date, obs_end: 
     return result
 
 
+DRIFT_TAU = 0.75   # extra systematic uncertainty (C) folded into far-bracket checks
+
+
+def _steps_from_centre(lo, hi, centre, hk: bool):
+    """Distance from the model centre to the bracket midpoint, in ladder steps.
+
+    One step = 1 C for HK floor brackets and whole-degree C ladders, 2 F for the
+    paired US ladders. Open-ended tails have no midpoint -> None. 10-24 的教训：
+    距中心 <=1 档的 NO 就是一次普通预报误差的靶子。
+    """
+    if lo is None or hi is None or centre is None:
+        return None
+    mid = lo + 0.5 if hk else (lo + hi) / 2
+    width = 1.0 if hk else (hi - lo + 1.0)
+    return abs(mid - centre) / width
+
+
 def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
     code = ev["code"]
     rows = []
@@ -885,9 +946,18 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
                 drift = max(drift,
                             _norm_probs([centre - s], sigma, lo, hi, half_width=0.0)[0],
                             _norm_probs([centre + s], sigma, lo, hi, half_width=0.0)[0])
+            st = _steps_from_centre(lo, hi, centre, hk=True)
+            p_eff, p_worst = drift, drift
+            if st is not None and st >= 2.0:
+                # 远端档（>=2 档）：把 ±1.5 度刚性漂移当基准会把 2σ 事件当底噪，
+                # 错杀 94% 胜率的远端 NO（10-25 马德里 5°C 例子）。改用概率加权：
+                # 在官方预报 sigma 上再叠加一个系统性漏估 tau。
+                sw = math.sqrt(sigma * sigma + DRIFT_TAU * DRIFT_TAU)
+                p_eff = max(p, _norm_probs([centre], sw, lo, hi, half_width=0.0)[0])
             rows.append(_row(ev, mk, p, p, p, None, None, centre=centre, sigma=sigma,
                              note=f"天文台官方预报{centre:.0f}°C，误差±{sigma:.1f}", spread=0.0,
-                             p_drift=drift))
+                             p_drift=p_eff, p_stress=p_worst,
+                             steps=st))
         return rows
 
     stats = station_stats(code, ev["kind"], target, obs_start, obs_end)
@@ -927,12 +997,22 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
                 drift = max(drift,
                             frac_in([x - s for x in v["bias"]], lo, hi),
                             frac_in([x + s for x in v["bias"]], lo, hi))
+        st = _steps_from_centre(lo, hi, median(centres), hk=False)
+        p_eff, p_worst = drift, drift
+        if st is not None and st >= 2.0:
+            # 远端档改用概率加权：成员正态近似 + 叠加 tau 的系统性漏估（同 HK）
+            pooled = [x for v in per_model.values() for x in v["bias"]]
+            mu = mean(pooled)
+            sd = pstdev(pooled) if len(pooled) > 1 else drift
+            sw = math.sqrt(sd * sd + (DRIFT_TAU * factor) ** 2)
+            p_eff = max(max(every), _norm_probs([mu], sw, lo, hi, half_width=0.5)[0])
         rows.append(_row(ev, mk, min(every), median(every), max(every),
                          pr, pb, centre=median(centres), sigma=median(
                              v["sigma"] for v in per_model.values()),
                          note=f"三模式中心 {min(centres):.0f}-{max(centres):.0f}"
                               f"{ev['unit']}，分歧 {spread:.1f}",
-                         spread=spread, p_drift=drift))
+                         spread=spread, p_drift=p_eff, p_stress=p_worst,
+                         steps=st))
     return rows
 
 
@@ -946,19 +1026,21 @@ def _norm_probs(centres, sigma, lo, hi, half_width=0.5):
     return out
 
 
-def _row(ev, mk, pmin, pmean, pmax, pr, pb, centre, sigma, note="", spread=None, p_drift=0.0):
+def _row(ev, mk, pmin, pmean, pmax, pr, pb, centre, sigma, note="", spread=None,
+         p_drift=0.0, steps=None, p_stress=None):
     tokens = mk.get("clobTokenIds")
     tokens = json.loads(tokens) if isinstance(tokens, str) else (tokens or [])
     return {
         "code": ev["code"], "city": city_name(ev["code"]), "kind": ev["kind"], "unit": ev["unit"],
         "title": ev["title"], "label": mk.get("groupItemTitle"),
         "p_min": pmin, "p_mean": pmean, "p_max": pmax, "p_drift": p_drift,
+        "p_stress": p_drift if p_stress is None else p_stress,
         "bid": as_float(mk.get("bestBid")), "ask": as_float(mk.get("bestAsk")),
         "vol": as_float(mk.get("volume24hr")) or 0.0,
         "yes_token": tokens[0] if tokens else None,
         "no_token": tokens[1] if len(tokens) > 1 else None,
         "centre": centre, "sigma": sigma, "note": note, "spread": spread,
-        "event_vol": ev["vol"],
+        "steps": steps, "event_vol": ev["vol"],
     }
 
 
@@ -987,6 +1069,13 @@ def attach_books(rows, spend, workers=4):
 KIND_CN = {"high": "最高温", "low": "最低温"}
 
 
+def _step_mark(r):
+    s = r.get("steps")
+    if s is None:
+        return ""
+    return f" 距中心{s:.1f}档" + ("⚠" if s <= 1.25 else "")
+
+
 def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False):
     def ok(r):
         sp = r.get("spread")
@@ -1003,7 +1092,7 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False):
         out.append("| 城市 | 市场 | 档位 | 模型给的概率 | 实际买入价 | 便宜多少 | 盘口深度 | 依据 |")
         out.append("|---|---|---|---|---|---|---|---|")
         for r in cand[:top]:
-            out.append(f"| {r['city']} | {KIND_CN[r['kind']]} | {r['label']} "
+            out.append(f"| {r['city']} | {KIND_CN[r['kind']]} | {r['label']}{_step_mark(r)} "
                        f"| {r['p_min']:.0%}（乐观 {r['p_max']:.0%}） "
                        f"| {r['yes_vwap']:.3f} | +{(r['p_min']-r['yes_vwap'])*100:.0f}pp "
                        f"| ${r['yes_depth']:.0f} | {r['note']} |")
@@ -1030,13 +1119,19 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False):
         for r in shown:
             no_v = r["no_vwap"]
             mark = " ⚠️脆弱" if r in fragile else ""
-            out.append(f"| {r['city']} | {KIND_CN[r['kind']]} | {r['label']}{mark} "
+            far = r.get("steps") is not None and r["steps"] >= 2.0
+            drift_txt = f"{1-r.get('p_drift',0):.0%}"
+            if far and r.get("p_stress") is not None:
+                drift_txt += f"（最坏{1-r['p_stress']:.0%}）"
+            out.append(f"| {r['city']} | {KIND_CN[r['kind']]} | {r['label']}{_step_mark(r)}{mark} "
                        f"| {1-r['p_max']:.0%}（保守 {1-r['p_min']:.0%}） "
                        f"| {no_v:.3f} | {(1-no_v)/no_v:.2f}:1 | +{((1-r['p_max'])-no_v)*100:.0f}pp "
-                       f"| {1-r.get('p_drift',0):.0%} | ${r['no_depth']:.0f} | {r['note']} |")
+                       f"| {drift_txt} | ${r['no_depth']:.0f} | {r['note']} |")
         if fragile:
             out.append(f"\n已过滤 {len(fragile)} 个漂移脆弱档（模型概率够，但 ±1.5°C 漂移就翻车"
                        f"——10/24 华沙 6°、亚特兰大 70-71° 都是这类）。加 --risky 查看。")
+        out.append("\n抗漂移口径：距中心 <2 档 = ±1.5° 最坏情形（贴脸档铁律）；"
+                   "≥2 档 = 概率加权（叠加 0.75° 系统性漏估），括号里给最坏情形供参考。")
         out.append("")
     return "\n".join(out)
 
@@ -1113,6 +1208,99 @@ def _cached_centre(code, kind, target, obs_start, obs_end, unit):
         return None
 
 
+SETTLE_HISTORY = pathlib.Path(CACHE, "settle_history.jsonl")
+
+
+def _append_history(records):
+    """Merge today's rows into settle_history.jsonl, replacing same (d, code, kind).
+
+    Re-running a date after HK's extract publishes just fills the gap -- no
+    duplicates, so --bias stays clean."""
+    if not records:
+        return
+    key = lambda r: (r["d"], r["code"], r["kind"])
+    fresh = {key(r): r for r in records}
+    old = []
+    if SETTLE_HISTORY.exists():
+        for line in SETTLE_HISTORY.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if key(r) not in fresh:
+                old.append(r)
+    rows = sorted(old + list(fresh.values()), key=lambda r: (r["d"], r["city"], r["kind"]))
+    SETTLE_HISTORY.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+
+
+def _centre_hit_winner(r):
+    """Did the winning bracket contain the cached model centre? None = no call."""
+    w = r.get("winner")
+    if not w or not isinstance(r.get("centre"), (int, float)):
+        return None
+    if r.get("code") == "HKO":
+        bd = hk_interval(w)
+        if not bd:
+            return None
+        lo, hi = bd                       # floor rule: [lo, hi)
+        return (lo is None or r["centre"] >= lo) and (hi is None or r["centre"] < hi)
+    bd = bounds(w)
+    if not bd:
+        return None
+    lo = bd[0] - 0.5 if bd[0] is not None else None
+    hi = bd[1] + 0.5 if bd[1] is not None else None
+    return (lo is None or r["centre"] >= lo) and (hi is None or r["centre"] <= hi)
+
+
+def bias_report() -> int:
+    """Replay settle history: how far the model centre lands from the actual."""
+    if not SETTLE_HISTORY.exists():
+        print("还没有结算历史：先跑 --settle YYYY-MM-DD（每天扫完记得结算，历史才攒得起来）。")
+        return 1
+    recs = []
+    for line in SETTLE_HISTORY.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                recs.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    graded = [r for r in recs if isinstance(r.get("centre"), (int, float))]
+    print(f"# 模型中心 vs 实际｜累计回测（{len(recs)} 条结算，其中 {len(graded)} 条有扫描时中心）\n")
+    if not graded:
+        print("还没有可回测的行：中心来自扫描缓存，--settle 之前当天要先扫过该日期。")
+        return 0
+
+    def stat(rs):
+        miss = [r["actual"] - r["centre"] for r in rs]
+        hits = [h for h in (_centre_hit_winner(r) for r in rs) if h is not None]
+        return {
+            "n": len(rs), "bias": mean(miss), "sigma": pstdev(miss) if len(miss) > 1 else 0.0,
+            "hit": (sum(hits) / len(hits)) if hits else None,
+            "close": sum(1 for m in miss if abs(m) <= 1.0) / len(miss),
+        }
+
+    groups: dict = {}
+    for r in graded:
+        groups.setdefault((r["city"], r["kind"], r.get("unit", "C")), []).append(r)
+    print("| 城市 | 市场 | n | 平均偏差 | σ | 中心档命中 | |偏差|≤1° |")
+    print("|---|---|---|---|---|---|---|")
+    for (city, kind, unit), rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        s = stat(rs)
+        hit = f"{s['hit']:.0%}" if s["hit"] is not None else "-"
+        print(f"| {city} | {KIND_CN.get(kind, kind)} | {s['n']} | {s['bias']:+.1f}°{unit} "
+              f"| {s['sigma']:.1f} | {hit} | {s['close']:.0%} |")
+    s = stat(graded)
+    print(f"| **合计** | - | {s['n']} | {s['bias']:+.2f} | {s['sigma']:.2f} | {s['hit']:.0%} | {s['close']:.0%} |")
+    print("\n读法：平均偏差是系统性偏移（正=模型偏冷）；σ 决定 NO 要离中心几档才稳；"
+          "中心档命中率 ≈ 贴脸 NO 的实际翻车率。样本按城市×市场积累，n<10 只当参考。")
+    return 0
+
+
 def settle(target: date) -> int:
     """Grade a finished date: actuals, winning bracket, and the model centre's miss."""
     merged, ids = [], set()
@@ -1126,6 +1314,7 @@ def settle(target: date) -> int:
     print("|---|---|---|---|---|---|")
     obs_end = target - timedelta(days=1)
     obs_start = obs_end - timedelta(days=64)
+    records = []
     for ev in sorted(events, key=lambda e: -e.get("vol") or 0):
         code, kind = ev["code"], ev["kind"]
         if code == "HKO":
@@ -1150,6 +1339,12 @@ def settle(target: date) -> int:
         miss = f"{v - centre:+.1f}" if centre is not None else "-"
         c_txt = f"{centre:.1f}" if centre is not None else "-"
         print(f"| {city_name(code)} | {KIND_CN[kind]} | {v:.1f}{unit} | {winner} | {c_txt} | {miss} |")
+        records.append({"d": target.isoformat(), "code": code, "city": city_name(code),
+                        "kind": kind, "unit": ev["unit"], "actual": v, "winner": winner,
+                        "centre": centre})
+    _append_history(records)
+    if records:
+        print(f"\n已并入结算历史 {len(records)} 行 → {SETTLE_HISTORY.name}（--bias 看累计偏差回测）")
     return 0
 
 
@@ -1170,6 +1365,8 @@ def main() -> int:
     ap.add_argument("--settle", default="",
                     help="Grade a finished date (YYYY-MM-DD) instead of scanning: actuals, "
                          "winning bracket, cached model centre.")
+    ap.add_argument("--bias", action="store_true",
+                    help="回测累计结算历史：模型中心偏差、中心档命中率（不用联网）。")
     ap.add_argument("--risky", action="store_true",
                     help="NO 表附带漂移脆弱档（默认过滤掉 ±1.5°C 就翻车的相邻档）。")
     ap.add_argument("--json", action="store_true")
@@ -1179,6 +1376,8 @@ def main() -> int:
               else datetime.now(ZoneInfo("UTC")).date() + timedelta(days=1))
     if args.settle:
         return settle(date.fromisoformat(args.settle))
+    if args.bias:
+        return bias_report()
     obs_end = target - timedelta(days=1)
     obs_start = obs_end - timedelta(days=args.lookback)
 
