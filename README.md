@@ -1,13 +1,14 @@
 # Trading Skills
 
-面向 AI 助手的两个只读交易研究技能。输出条件化计划，不自动交易，也不保证收益。
+面向 AI 助手的三个只读交易研究技能。输出条件化计划，不自动交易，也不保证收益。
 
 - **pm-edge**：预测市场研究，优先天气与文化；明确事件日期，比较 YES / NO，先审计结算规则，再核对报价与费用。
 - **trade**：BTC / ETH（可扩展到其他币）技术与期权研究；一条命令带现价、资金费率、OI、多空比快照、1H/4H 日内背景与山寨币筛选；回复第一句就给「现在做什么」的大白话结论；区分行情快照、模型假设和可执行条件，不把指标或历史波动率比较直接当作买卖信号。
+- **stock**：Gate 股票类 USDT 永续（美股/港股/指数/未上市 AI 公司）条件研究；无默认标的，`--list` 查合约；一条命令带执行层快照（标记价 vs 指数锚溢价、每小时资金费、OI、多空账户数）、Yahoo 底层指标、1H 日内背景与美股时段状态；单一场所与财报未核查照直说。
 
 ## 安装
 
-将 `skills/pm-edge` 和 `skills/trade` 复制到助手支持的 skill 目录。在 MiMo Desktop 中可使用 `~/.config/mimocode/skills/`；通过插件页面确认已发现技能。不要同时安装同名的多份副本。
+将 `skills/pm-edge`、`skills/trade` 和 `skills/stock` 复制到助手支持的 skill 目录。在 MiMo Desktop 中可使用 `~/.config/mimocode/skills/`；通过插件页面确认已发现技能。不要同时安装同名的多份副本。
 
 ## 怎么问
 
@@ -16,6 +17,8 @@
 - `/trade BTC、ETH 现在什么结构？我想 79500 接多、止损 77800，给分批计划和期权适配。`
 - `/trade 今天有没有日内级别的机会？`
 - `/trade 顺带扫一下山寨币有什么值得细看的。`
+- `/stock 长鑫、宇树、智谱我现在该怎么办？我有多单。`
+- `/stock Gate 上有哪些股票合约可以交易？`
 
 ## 天气温盘：问一句，回一张可执行的表
 
@@ -64,6 +67,22 @@ python skills/pm-edge/scripts/pm_weather.py --bias                      # 累计
 python skills/trade/scripts/crypto_ctx.py --json            # BTC+ETH 全景
 python skills/trade/scripts/crypto_ctx.py --json --scan     # 加山寨币筛选
 ```
+
+## stock：Gate 股票永续，先看溢价和时段
+
+Gate 上能交易股票类 USDT 永续：美股主流（NVDA、TSLA、MSTR…）、指数、港股与未上市 AI 公司（长鑫 CXMT、宇树 UNITREE、智谱 ZHIPU、OpenAI、Anthropic…）。`/stock` 回答的是同一套问题——现在什么位置、该等还是该动——但多了两个股票特有的坐标：
+
+- **溢价**：永续标记价对比 Gate 自己的指数锚（以及美股标的的 Yahoo 底层现价），一眼看出这个 24/7 市场此刻偏离真实股价多远——尤其周末和盘后，全靠情绪定价。
+- **时段与锚定状态**：美股时段内数据有底层撮合支撑；闭市时明确提示"单一场所情绪定价"；长鑫/宇树/智谱这类只有 Gate 一家定价的标的，会直接说明无外部锚定、历史有多短、指标降级到了什么程度。
+
+另外照直说：财报日历拿不到自动数据，谈计划前必须人工核查财报日；资金费率按小时结算，持仓成本和加密不是一个算法。想直接跑脚本：
+
+```bash
+python skills/stock/scripts/stock_ctx.py --list            # 查可交易的股票合约
+python skills/stock/scripts/stock_ctx.py --symbols CXMT,NVDA --json   # 双层全景
+```
+
+没有默认标的——想看什么自己点名。
 
 ## 重要边界
 
