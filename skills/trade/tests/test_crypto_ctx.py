@@ -251,6 +251,59 @@ class RegressionTests(unittest.TestCase):
         card = ctx.conditional_card(self.args("--bias", "short", "--entry", "100", "--stop", "200"))
         self.assertTrue(all(v is None for v in card["gross_R_targets"].values()))
 
+    def test_multi_timeframe_block(self):
+        with patch.object(ctx, "klines", side_effect=self.history), \
+             patch.object(ctx, "option_chain", return_value=[]), \
+             patch.object(ctx, "fetch_live", return_value={}):
+            code, out, _ = self.invoke(["--json"])
+            self.assertEqual(code, 0)
+            mtf = json.loads(out)["symbols"][0]["multi_timeframe"]
+            self.assertEqual(mtf["1h"]["rsi14"], 50.0)
+            self.assertEqual(mtf["1h"]["state"], "mixed")
+            self.assertIn("rsi14", mtf["4h"])
+            self.assertIn("nearest_4h_pivot", mtf)
+            self.assertIn("kind", mtf["nearest_4h_pivot"])
+            self.assertIsInstance(mtf["intraday_flags"], list)
+
+    def test_multi_timeframe_1h_failure_tolerated(self):
+        def klines_no_1h(pair, interval, limit=300, **kwargs):
+            if interval == "1h":
+                raise OSError("1h down")
+            return self.history(pair, interval, limit)
+
+        with patch.object(ctx, "klines", side_effect=klines_no_1h), \
+             patch.object(ctx, "option_chain", return_value=[]), \
+             patch.object(ctx, "fetch_live", return_value={}):
+            code, out, _ = self.invoke(["--json"])
+            self.assertEqual(code, 0)
+            mtf = json.loads(out)["symbols"][0]["multi_timeframe"]
+            self.assertEqual(mtf["1h"].get("note"), "unavailable_or_insufficient")
+            self.assertIn("rsi14", mtf["4h"])
+            self.assertNotIn("1H超买", "".join(mtf["intraday_flags"]))
+
+    def test_multi_timeframe_intraday_flags(self):
+        rising_1d = self.candles("1d", 240, closes=[100.0 + i for i in range(240)])
+        rising_1h = self.candles("1h", 300, closes=[400.0 + i for i in range(300)])
+        seq = {"1d": rising_1d, "4h": self.candles("4h", 100, closes=[380.0 + i for i in range(100)]),
+               "1h": rising_1h}
+        with patch.object(ctx, "klines", side_effect=lambda p, i, limit=300, **kw: seq[i]), \
+             patch.object(ctx, "option_chain", return_value=[]), \
+             patch.object(ctx, "fetch_live", return_value={}):
+            code, out, _ = self.invoke(["--json"])
+            self.assertEqual(code, 0)
+            mtf = json.loads(out)["symbols"][0]["multi_timeframe"]
+            self.assertGreaterEqual(mtf["1h"]["rsi14"], 70)
+            self.assertTrue(any("1H超买" in f for f in mtf["intraday_flags"]))
+
+    def test_human_output_contains_multi_timeframe_line(self):
+        with patch.object(ctx, "klines", side_effect=self.history), \
+             patch.object(ctx, "option_chain", return_value=[]), \
+             patch.object(ctx, "fetch_live", return_value={}):
+            code, out, _ = self.invoke([])
+            self.assertEqual(code, 0)
+            self.assertIn("多周期", out)
+            self.assertIn("日内标记", out)
+
 
 if __name__ == "__main__":
     unittest.main()

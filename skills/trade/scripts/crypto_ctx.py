@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only closed-candle context for BTC/ETH (+optional altcoin screen), conditional linear sizing and option research."""
+"""Read-only closed-candle context for BTC/ETH (+1H/4H multi-timeframe, optional altcoin screen), conditional linear sizing and option research."""
 from __future__ import annotations
 
 import argparse
@@ -20,7 +20,7 @@ DERIBIT = "https://www.deribit.com/api/v2"
 DEFAULT_SYMBOLS = "BTC,ETH"
 DEFAULT_SCAN_LIST = "SOL,BNB,XRP,DOGE,ADA,AVAX,LINK,LTC"
 SHARED_WARNINGS = [
-    "EMA排列/RSI/ATR/摆点/资金费率/OI/多空比均为描述性状态，不是方向信号或胜率证据",
+    "EMA排列/RSI/ATR/摆点/资金费率/OI/多空比/1H与4H多周期状态均为描述性状态，不是方向信号或胜率证据",
     "30日RV与IV比较不构成期权买卖优势；期限、风险溢价、费用、价差与事件日历未核查",
     "止损触发与平仓请求不保证成交；跳空、滑点、流动性可使亏损超过预算",
     "期权为inverse结算研究候选：乘数、保证金、深度未核验，mid不是可成交成本，不输出USD最大亏损",
@@ -421,6 +421,10 @@ def build_symbol_report(args, symbol, now):
     now_ms = now.timestamp() * 1000
     daily = klines(pair, "1d", now_ms=now_ms)
     four_h = klines(pair, "4h", 200, now_ms=now_ms)
+    try:
+        one_h = klines(pair, "1h", 300, now_ms=now_ms)
+    except Exception:
+        one_h = []
     if len(daily) < 200 or len(four_h) < 5:
         raise ValueError("Insufficient completed candle history (200 daily / 5 four-hour required)")
     for rows, interval in ((daily, 86400000), (four_h, 14400000)):
@@ -433,6 +437,41 @@ def build_symbol_report(args, symbol, now):
     e20, e50, e200 = (ema(closes, p) for p in (20, 50, 200))
     a14 = atr(daily)
     highs, lows = pivots(four_h)
+    mtf = {}
+    if len(one_h) >= 50:
+        closes_1h = [r["close"] for r in one_h]
+        e20_1h, e50_1h = ema(closes_1h, 20), ema(closes_1h, 50)
+        state = ("above" if closes_1h[-1] > e20_1h > e50_1h
+                 else "below" if closes_1h[-1] < e20_1h < e50_1h else "mixed")
+        mtf["1h"] = {"close": sig(closes_1h[-1]), "rsi14": round(rsi(closes_1h), 1),
+                     "ema20": sig(e20_1h), "ema50": sig(e50_1h), "state": state}
+    else:
+        mtf["1h"] = {"note": "unavailable_or_insufficient"}
+    try:
+        closes_4h = [r["close"] for r in four_h]
+        mtf["4h"] = {"close": sig(closes_4h[-1]), "rsi14": round(rsi(closes_4h), 1),
+                     "ema20": sig(ema(closes_4h, 20))}
+    except Exception:
+        mtf["4h"] = {"note": "unavailable"}
+    nearest = None
+    for price, kind in [(p[1], "high") for p in highs] + [(p[1], "low") for p in lows]:
+        if nearest is None or abs(price - last) < abs(nearest[0] - last):
+            nearest = (price, kind)
+    if nearest is not None:
+        mtf["nearest_4h_pivot"] = {"kind": nearest[1], "price": sig(nearest[0]),
+                                   "dist_pct": round(abs(nearest[0] - last) / last * 100, 2)}
+    intraday_flags = []
+    r1 = mtf["1h"].get("rsi14")
+    if r1 is not None:
+        if r1 >= 70:
+            intraday_flags.append(f"1H超买({r1})")
+        elif r1 <= 30:
+            intraday_flags.append(f"1H超卖({r1})")
+    pivot = mtf.get("nearest_4h_pivot")
+    if pivot and pivot["dist_pct"] <= 0.6:
+        intraday_flags.append("贴近4H高点" if pivot["kind"] == "high" else "贴近4H低点")
+    mtf["intraday_flags"] = intraday_flags
+    mtf["usage"] = "日内背景描述非信号；日内条件卡有效期至下一根4H收盘"
     hi, lo = max(r["high"] for r in daily[-90:]), min(r["low"] for r in daily[-90:])
     auto_scenarios = []
     if args.auto:
@@ -464,6 +503,7 @@ def build_symbol_report(args, symbol, now):
               "range_retracements_not_validated_swing": {str(r): sig(hi - (hi - lo) * r) for r in (.382, .5, .618, .786)},
               "last_confirmed_4h_pivot_high": sig(highs[-1][1]) if highs else None,
               "last_confirmed_4h_pivot_low": sig(lows[-1][1]) if lows else None,
+              "multi_timeframe": mtf,
               "live_snapshot": fetch_live(pair),
               "conditional_order_card": auto_scenarios[0] if auto_scenarios else conditional_card(args, a14),
               "alternative_conditional_cards": auto_scenarios[1:],
@@ -546,6 +586,16 @@ def format_symbol_human(report):
     retr = report["range_retracements_not_validated_swing"]
     lines.append(f"90日区间 {rng['low']}~{rng['high']} | 区间回撤参考 38.2% {retr['0.382']} / 50% {retr['0.5']}")
     lines.append(f"4H确认摆点 高 {report['last_confirmed_4h_pivot_high']} / 低 {report['last_confirmed_4h_pivot_low']}")
+    m = report.get("multi_timeframe", {})
+    h1, h4 = m.get("1h", {}), m.get("4h", {})
+    h1_text = (f"1H RSI {h1['rsi14']} EMA20/50 {h1['ema20']}/{h1['ema50']}（{h1['state']}）"
+               if "rsi14" in h1 else "1H n/a")
+    h4_text = f"4H RSI {h4['rsi14']} EMA20 {h4['ema20']}" if "rsi14" in h4 else "4H n/a"
+    pivot = m.get("nearest_4h_pivot")
+    pivot_text = (f"距最近4H{'高' if pivot['kind'] == 'high' else '低'}点 {pivot['price']}（{pivot['dist_pct']}%）"
+                  if pivot else "无最近摆点")
+    flags_text = "、".join(m.get("intraday_flags", [])) or "-"
+    lines.append(f"多周期 {h1_text} | {h4_text} | {pivot_text} | 日内标记: {flags_text}")
     funding = live.get("funding", {})
     rate = funding.get("rate_8h")
     oi_chg = live.get("oi_change_24h_pct")

@@ -1,4 +1,4 @@
 {
   "displayName": "Conditional Crypto Research",
-  "brief": "One command covers BTC+ETH by default: closed-candle indicators, live/funding/OI/long-short snapshot, option candidates and an altcoin screen; conditional cards first (with tranche ladder and options-fit notes), read-only, no orders."
+  "brief": "One command covers BTC+ETH by default: closed-candle indicators, 1H/4H multi-timeframe intraday context, live/funding/OI/long-short snapshot, option candidates and an altcoin screen; plain-language verdict first, then conditional cards (with tranche ladder and options-fit notes), read-only, no orders."
 }
