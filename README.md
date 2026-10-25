@@ -23,6 +23,8 @@
 
 `skills/pm-edge/scripts/pm_weather.py` 把「读规则 → 拉观测 → 建概率 → 读盘口」合成一条命令：
 
+<img width="1153" height="751" alt="image" src="https://github.com/user-attachments/assets/fdd41015-a990-4821-9278-17de0a653367" />
+
 ```bash
 python scripts/pm_weather.py --date 2026-10-25 --mode both --top 10 --min-edge 0.05
 python scripts/pm_weather.py --date 2026-10-25 --mode no --only KLGA,东京,香港
