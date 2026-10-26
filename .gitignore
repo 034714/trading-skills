@@ -10,3 +10,7 @@ __pycache__/
 # Runtime caches are local data, never part of a release archive
 .cache/
 **/.cache/
+
+# Security-tool local state must never be committed
+.mimosa/
+**/.mimosa/
