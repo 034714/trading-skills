@@ -12,12 +12,17 @@ Facts it encodes (all read out of the market rules, not assumed):
 Probabilities: for each of ECMWF/GFS/ICON take the target-day ensemble members,
 shift by that model's trailing bias (obs - previous_day1), and read off the
 fraction of members inside the bracket. The reported p range is the min and max
-over 3 models x {raw, bias-shifted}, i.e. the least and most favourable reading.
+over 3 models x {raw, bias-shifted}. Member fractions are an UNCALIBRATED scenario,
+never a verified win rate, and a 100% member reading is not a guarantee.
 
-Every NO row also carries a drift check: the worst P(hit) if all members move
-+/-0.5/1/1.5 deg toward the bracket. A NO whose edge evaporates under a 1 deg
-forecast miss is "fragile" and is filtered out by default (--risky shows it) --
-adjacent-to-centre brackets are where NO tickets go to die.
+Every NO row carries the same stress check regardless of distance from centre:
+the worst P(hit) if all members move +/-0.5/1/1.5 deg toward the bracket, zero
+drift included. Rows that lose their edge there are research-only (--risky
+shows them); there is no far-bracket exemption.
+
+Batch replies are mapped to stations by coordinate and fail closed on mismatch;
+cache files live under a versioned namespace so older contaminated data is never
+read back.
 
 `--settle YYYY-MM-DD` grades a finished date instead of scanning: actuals from
 IEM/HKO, the winning bracket, and the cached model centre's miss. Every graded
