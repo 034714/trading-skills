@@ -7,3 +7,6 @@ __pycache__/
 *ledger*.jsonl
 *.lnk
 .DS_Store
+# Runtime caches are local data, never part of a release archive
+.cache/
+**/.cache/

@@ -176,6 +176,133 @@ def vwap(levels, spend_usd: float):
     return (cost / got, got) if got > 0 else (None, 0.0)
 
 
+def full_fill(levels, *, spend_usd=None, shares=None):
+    """Buy asks by budget OR share count; partial liquidity never yields a full VWAP.
+
+    The legacy vwap() keeps its tuple contract for other scripts. Callers making
+    executable-size claims must use this helper and inspect complete.
+    """
+    if (spend_usd is None) == (shares is None):
+        raise ValueError("specify exactly one of spend_usd or shares")
+    target = spend_usd if spend_usd is not None else shares
+    if not isinstance(target, (int, float)) or not math.isfinite(target) or target <= 0:
+        raise ValueError("fill size must be finite and positive")
+    clean = []
+    for price, size in levels:
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (price, size)):
+            raise ValueError("invalid book level")
+        if not 0 < price <= 1 or size < 0:
+            raise ValueError("invalid book price or size")
+        clean.append((price, size))
+    cost = got = 0.0
+    for price, size in sorted(clean):
+        remain = (target - cost) / price if spend_usd is not None else target - got
+        take = min(size, max(0.0, remain))
+        cost += take * price
+        got += take
+        if (cost if spend_usd is not None else got) >= target - 1e-9:
+            break
+    complete = (cost if spend_usd is not None else got) >= target - 1e-9
+    average = cost / got if got else None
+    return {"complete": complete, "cost": cost, "shares": got,
+            "vwap": average if complete else None, "partial_vwap": average,
+            "requested_spend": spend_usd, "requested_shares": shares}
+
+
+def passive_limit(best_ask, discount_ticks, tick_size, best_bid=None):
+    """A passive bid scenario below the best ask; never an available ask or a fill.
+
+    best_bid is accepted for context only: bidding slightly above it to improve
+    the queue is still passive as long as the price stays below best_ask.
+    """
+    from decimal import Decimal, ROUND_FLOOR
+    if not isinstance(discount_ticks, int) or discount_ticks < 1:
+        raise ValueError("discount must be a positive number of ticks")
+    if not math.isfinite(tick_size) or not 0 < tick_size < 1:
+        raise ValueError("tick size must be between zero and one")
+    if best_ask is None:
+        return None
+    ask, tick = Decimal(str(best_ask)), Decimal(str(tick_size))
+    price = ((ask / tick).to_integral_value(rounding=ROUND_FLOOR) - discount_ticks) * tick
+    return float(price) if 0 < price < ask else None
+
+
+def analyze_books(yes_bids, yes_asks, no_bids, no_asks, shares,
+                  *, fee_per_share=None, fees_verified=False, fee_rate=None,
+                  discount_ticks=0, tick_size=None):
+    """Descriptive liquidity analysis of TWO real token books, same share count.
+
+    Ratios are USD liquidity within 2c of each side's best quote: they describe
+    orders, not traders, conviction or outcome probability. A YES+NO pair is
+    only meaningful with equal shares bought from both ASK ladders; a partially
+    filled leg is not a locked pair. Fees are a user scenario unless explicitly
+    verified, and even verified arithmetic still depends on execution/settlement.
+    """
+    for fee in (fee_per_share, fee_rate):
+        if fee is not None and (not math.isfinite(fee) or fee < 0):
+            raise ValueError("fees must be finite and nonnegative")
+    if not isinstance(shares, (int, float)) or not math.isfinite(shares) or shares <= 0:
+        raise ValueError("shares must be finite and positive")
+    yb, ya = sorted(yes_bids, reverse=True), sorted(yes_asks)
+    nb, na = sorted(no_bids, reverse=True), sorted(no_asks)
+    yf, nf = full_fill(ya, shares=shares), full_fill(na, shares=shares)
+    out = {"yes_fill": yf, "no_fill": nf,
+           "yes_vwap": yf["vwap"], "no_vwap": nf["vwap"],
+           "yes_bid": yb[0][0] if yb else None, "yes_ask": ya[0][0] if ya else None,
+           "no_bid": nb[0][0] if nb else None, "no_ask": na[0][0] if na else None,
+           "yes_depth": depth_usd(ya), "no_depth": depth_usd(na),
+           "yes_bid_depth": depth_usd(yb), "no_bid_depth": depth_usd(nb),
+           "liquidity_basis": "各侧最优报价2美分内美元深度；是挂单量，不是人数、信心或概率",
+           "fee_status": "已核实每份费用" if fees_verified and fee_per_share is not None else
+                         "用户费用情景（未核实）" if fee_per_share is not None or fee_rate is not None else "费用未知"}
+    for side, fill in (("yes", yf), ("no", nf)):
+        if fee_per_share is not None:
+            out[f"{side}_fee"] = fee_per_share
+        elif fee_rate is not None and fill["complete"]:
+            # Fee formula varies per market; integrate each price level.
+            ladder = ya if side == "yes" else na
+            remaining, total = shares, 0.0
+            for price, size in ladder:
+                take = min(size, remaining)
+                total += take * withdraw_fee(price, fee_rate)
+                remaining -= take
+                if remaining <= 1e-9:
+                    break
+            out[f"{side}_fee"] = total / shares
+        else:
+            out[f"{side}_fee"] = None
+        if discount_ticks:
+            out[f"{side}_limit"] = (passive_limit(out[f"{side}_ask"], discount_ticks,
+                                                   tick_size, out[f"{side}_bid"])
+                                    if tick_size is not None else None)
+    ask_total = out["yes_depth"] + out["no_depth"]
+    bid_total = out["yes_bid_depth"] + out["no_bid_depth"]
+    out["ask_no_share"] = out["no_depth"] / ask_total if ask_total else None
+    out["bid_no_share"] = out["no_bid_depth"] / bid_total if bid_total else None
+    complete = bool(yf["complete"] and nf["complete"])
+    gross = (shares - yf["cost"] - nf["cost"]) if complete else None
+    net = (gross - shares * (out["yes_fee"] + out["no_fee"])
+           if complete and fees_verified and out["yes_fee"] is not None
+           and out["no_fee"] is not None else None)
+    scenario = (gross - shares * (out["yes_fee"] + out["no_fee"])
+                if complete and out["yes_fee"] is not None and out["no_fee"] is not None
+                else None)
+    out["pair"] = {"shares_each": shares, "complete": complete,
+                   "yes_fill": yf, "no_fill": nf,
+                   "gross_profit": gross, "net_profit": net,
+                   "scenario_net_profit": scenario,
+                   "fees_verified": fees_verified and fee_per_share is not None,
+                   "status": ("深度不足，两腿不能等份成交" if not complete else
+                              "已核实费用的条件净价差" if net is not None else "仅毛价差观察"),
+                   "warning": "等份双侧ASK快照；非原子成交，需复核结算一致性、费用及撤单风险"}
+    return out
+
+
+def markdown_cell(value):
+    """Escape text so an external market title cannot break a Markdown table."""
+    return str(value if value is not None else "-").replace("|", "&#124;").replace("\r", " ").replace("\n", " ")
+
+
 def depth_usd(levels, band: float = 0.02):
     """USD available within `band` of the best level."""
     if not levels:

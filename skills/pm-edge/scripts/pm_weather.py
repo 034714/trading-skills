@@ -55,10 +55,15 @@ from statistics import mean, median, pstdev
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pm_common import UA, GAMMA, CLOB, KALSHI, http_json, as_float
+from pm_common import (UA, GAMMA, CLOB, http_json, as_float,
+                       analyze_books, markdown_cell)
 
-CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+CACHE_SCHEMA = "weather-v3-validated"
+CACHE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+# Old raw, parsed, stats and history files stay untouched and are never trusted here.
+CACHE = os.path.join(CACHE_ROOT, CACHE_SCHEMA)
 os.makedirs(CACHE, exist_ok=True)
+_PREWARM_FAILED = set()
 LOCK = threading.Lock()
 # Open-Meteo allows 600 calls/min but 429s on bursts; batching cut the per-scan
 # call count to ~30, so 4 in flight is comfortably inside the limit.
@@ -116,14 +121,8 @@ def _validate_url(url: str) -> str:
     host = p.hostname or ""
     if not host or host in ("localhost", "0.0.0.0") or host.endswith(".local"):
         raise ValueError(f"rejected host: {host}")
-    import ipaddress
-    try:
-        addr = ipaddress.ip_address(host)
-        if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
-            raise ValueError(f"rejected address: {host}")
-    except ValueError:
-        pass  # hostname, not an IP — fine
-    return url
+    from pm_common import check_url
+    return check_url(url)
 
 
 def cached(key: str, url: str, ttl_hours: float = 3.0):
@@ -367,28 +366,6 @@ def book(token: str, attempts: int = 3):
             import time
             time.sleep(0.6 * (i + 1))
     raise last
-
-
-def vwap(levels, spend):
-    cost = got = 0.0
-    for p, s in levels:
-        if p <= 0:
-            break
-        take = min(s, (spend - cost) / p)
-        if take <= 0:
-            break
-        cost += take * p
-        got += take
-        if cost >= spend - 1e-9:
-            break
-    return (cost / got, got) if got > 0 else (None, 0.0)
-
-
-def depth(levels, band=0.02):
-    if not levels:
-        return 0.0
-    best = levels[0][0]
-    return sum(p * s for p, s in levels if abs(p - best) <= band)
 
 
 # ---------------------------------------------------------------- discovery
@@ -721,6 +698,39 @@ def _split_members(daily: dict, variable: str) -> dict:
     return per
 
 
+def _mapped_batch(data, stations, dataset):
+    """Require one response per requested coordinate in the same order."""
+    items = data if isinstance(data, list) else ([data] if len(stations) == 1 else None)
+    if items is None or len(items) != len(stations):
+        raise ValueError(f"{dataset} returned {0 if items is None else len(items)} locations for {len(stations)} stations")
+    out = []
+    for station, item in zip(stations, items):
+        if not isinstance(item, dict):
+            raise ValueError(f"{dataset} missing location object for {station}")
+        try:
+            lat, lon = float(item["latitude"]), float(item["longitude"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{dataset} response has no coordinates for {station}") from exc
+        expected = STATIONS[station]
+        # Response coordinates describe the selected model grid cell, not the
+        # requested airport. Reject distant cells and ambiguous batch identities.
+        if not math.isfinite(lat) or not math.isfinite(lon):
+            raise ValueError(f"{dataset} invalid coordinates for {station}")
+        distances = [(abs(lat - STATIONS[s]["lat"]) ** 2 +
+                      abs(lon - STATIONS[s]["lon"]) ** 2, s) for s in stations]
+        nearest = min(distances)[1]
+        if (abs(lat - expected["lat"]) > 0.5 or abs(lon - expected["lon"]) > 0.5
+                or nearest != station):
+            raise ValueError(f"{dataset} coordinate mismatch for {station}: {lat},{lon}")
+        out.append((station, item))
+    return out
+
+
+def _batch_cache_key(prefix, zone, stations, *params):
+    identity = [(s, STATIONS[s]["lat"], STATIONS[s]["lon"]) for s in stations]
+    return f"{prefix}_{zone}_{json.dumps(identity,separators=(',',':'))}_{'_'.join(map(str, params))}"
+
+
 def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
     """Pull everything the pricing pass needs in bulk, before the per-event pool.
 
@@ -743,9 +753,9 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
             "start_date": obs_start.isoformat(), "end_date": obs_end.isoformat(),
             "timezone": zone, "models": ",".join(MODELS),
         })
-        data = cached(f"prevbatch_{zone}_{obs_start}_{obs_end}",
+        data = cached(_batch_cache_key("prevbatch", zone, sts, obs_start, obs_end),
                       f"https://previous-runs-api.open-meteo.com/v1/forecast?{q}")
-        for st, item in zip(sts, data if isinstance(data, list) else [data]):
+        for st, item in _mapped_batch(data, sts, "previous runs"):
             h = item.get("hourly") or {}
             times = h.get("time") or []
             per = {}
@@ -778,9 +788,9 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
             "start_date": target.isoformat(), "end_date": target.isoformat(),
             "timezone": zone, "models": ENS_MODELS,
         })
-        data = cached(f"ensbatch_{zone}_{target}",
+        data = cached(_batch_cache_key("ensbatch", zone, sts, target, ENS_MODELS),
                       f"https://ensemble-api.open-meteo.com/v1/ensemble?{q}")
-        for st, item in zip(sts, data if isinstance(data, list) else [data]):
+        for st, item in _mapped_batch(data, sts, "ensemble"):
             daily = item.get("daily") or {}
             for variable in ("temperature_2m_max", "temperature_2m_min"):
                 per = _split_members(daily, variable)
@@ -864,8 +874,10 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
             print(f"prewarm {label} 拉取失败（{names}）：沿用上次缓存，数据可能不是最新",
                   file=sys.stderr)
         else:
+            with LOCK:
+                _PREWARM_FAILED.update(sts)
             print(f"⚠ prewarm 重试后仍失败: {label} — {names}；这些城市本次数据不全，"
-                  f"概率不可靠，请稍后重跑同一命令（缓存会续上）", file=sys.stderr)
+                  f"已从候选中剔除（不给不完整数据算概率），请稍后重跑同一命令", file=sys.stderr)
 
 
 def station_stats(code: str, kind: str, target: date, obs_start: date, obs_end: date):
@@ -907,26 +919,37 @@ def station_stats(code: str, kind: str, target: date, obs_start: date, obs_end: 
     return result
 
 
-DRIFT_TAU = 0.75   # extra systematic uncertainty (C) folded into far-bracket checks
+DRIFT_TAU = 0.75   # retained for cache/ABI compatibility; no longer used in any gate
 
 
 def _steps_from_centre(lo, hi, centre, hk: bool):
-    """Distance from the model centre to the bracket midpoint, in ladder steps.
+    """Distance from the bracket edge, in ladder widths. Zero means the centre is
+    INSIDE the bracket (the worst case for selling its NO) — never "half a step"
+    just because the bracket midpoint differs from the centre.
 
-    One step = 1 C for HK floor brackets and whole-degree C ladders, 2 F for the
-    paired US ladders. Open-ended tails have no midpoint -> None. 10-24 的教训：
-    距中心 <=1 档的 NO 就是一次普通预报误差的靶子。
+    HK brackets are already widened to a [lo, hi) floor interval; the whole-degree
+    ladders use a +/-0.5 half-width, matching _norm_probs.
     """
     if lo is None or hi is None or centre is None:
         return None
-    mid = lo + 0.5 if hk else (lo + hi) / 2
-    width = 1.0 if hk else (hi - lo + 1.0)
-    return abs(mid - centre) / width
+    if hk:
+        low_edge, high_edge = lo, hi
+        if low_edge <= centre < high_edge:
+            return 0.0
+        return (centre - high_edge) if centre >= high_edge else (low_edge - centre)
+    low_edge, high_edge = lo - 0.5, hi + 0.5
+    width = hi - lo + 1.0
+    if low_edge <= centre <= high_edge:
+        return 0.0
+    gap = (centre - high_edge) if centre > high_edge else (low_edge - centre)
+    return gap / width
 
 
 def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
     code = ev["code"]
     rows = []
+    if code in _PREWARM_FAILED:
+        return rows                     # incomplete inputs must not produce a probability
     if code == "HKO":
         # HK settles on the Observatory Daily Extract at 0.1 C precision, and the
         # rule says the bracket CONTAINS the reading -> boundaries sit on the integer,
@@ -935,7 +958,8 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
         if ev["kind"] not in est:
             return rows
         e = est[ev["kind"]]
-        centre, sigma = e["official"], max(e["sigma"], 1.5)  # HKO ±1.5°C = 满分误差
+        centre, sigma = e["official"], e["sigma"]
+        hko_note = f"天文台官方预报{centre:.0f}°C；网格残差σ≈{sigma:.1f}，官方误差未校准"
         for mk in ev["markets"]:
             bd = hk_interval(mk.get("groupItemTitle"))
             if not bd:
@@ -949,17 +973,13 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
                             _norm_probs([centre - s], sigma, lo, hi, half_width=0.0)[0],
                             _norm_probs([centre + s], sigma, lo, hi, half_width=0.0)[0])
             st = _steps_from_centre(lo, hi, centre, hk=True)
-            p_eff, p_worst = drift, drift
-            if st is not None and st >= 2.0:
-                # 远端档（>=2 档）：把 ±1.5 度刚性漂移当基准会把 2σ 事件当底噪，
-                # 错杀 94% 胜率的远端 NO（10-25 马德里 5°C 例子）。改用概率加权：
-                # 在官方预报 sigma 上再叠加一个系统性漏估 tau。
-                sw = math.sqrt(sigma * sigma + DRIFT_TAU * DRIFT_TAU)
-                p_eff = max(p, _norm_probs([centre], sw, lo, hi, half_width=0.0)[0])
-            rows.append(_row(ev, mk, p, p, p, None, None, centre=centre, sigma=sigma,
-                             note=f"天文台官方预报{centre:.0f}°C，误差±{sigma:.1f}", spread=0.0,
-                             p_drift=p_eff, p_stress=p_worst,
-                             steps=st))
+            drift = max(p, drift)
+            row = _row(ev, mk, p, p, p, None, None, centre=centre, sigma=sigma,
+                       note=hko_note + "；网格残差非官方误差，仅情景观察", spread=0.0,
+                       p_drift=drift, p_stress=drift, steps=st)
+            row["probability_basis"] = "未校准正态情景，非已验证胜率"
+            row["research_only"] = True
+            rows.append(row)
         return rows
 
     stats = station_stats(code, ev["kind"], target, obs_start, obs_end)
@@ -1000,14 +1020,7 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
                             frac_in([x - s for x in v["bias"]], lo, hi),
                             frac_in([x + s for x in v["bias"]], lo, hi))
         st = _steps_from_centre(lo, hi, median(centres), hk=False)
-        p_eff, p_worst = drift, drift
-        if st is not None and st >= 2.0:
-            # 远端档改用概率加权：成员正态近似 + 叠加 tau 的系统性漏估（同 HK）
-            pooled = [x for v in per_model.values() for x in v["bias"]]
-            mu = mean(pooled)
-            sd = pstdev(pooled) if len(pooled) > 1 else drift
-            sw = math.sqrt(sd * sd + (DRIFT_TAU * factor) ** 2)
-            p_eff = max(max(every), _norm_probs([mu], sw, lo, hi, half_width=0.5)[0])
+        p_eff = p_worst = max(max(every), drift)
         rows.append(_row(ev, mk, min(every), median(every), max(every),
                          pr, pb, centre=median(centres), sigma=median(
                              v["sigma"] for v in per_model.values()),
@@ -1046,15 +1059,13 @@ def _row(ev, mk, pmin, pmean, pmax, pr, pb, centre, sigma, note="", spread=None,
     }
 
 
-def attach_books(rows, spend, workers=4, fee_rate: float = 0.04):
-    """Enrich rows with real YES/NO order-book data.
+def attach_books(rows, spend, workers=4, fee_rate=None, fee_per_share=None,
+                 discount_ticks=0, tick_size=None):
+    """Attach real YES/NO book facts from the shared analysis helper.
 
-    Generalised beyond weather: each row is keyed by `label` (the human-readable
-    market question, not just a bracket ladder) so the same path serves crypto
-    price, politics, pop-culture, etc. Two cross-market gates fold in here:
-
-    * fee_drag  = fee_rate * price * (1-price)   (Polymarket/Kalshi taker model)
-    * lock_spread = (yes_bid + no_ask) - 1.00     (<0 and clearing fee => risk-free hedge)
+    --spend is the planned share count here, applied to BOTH books so reported
+    prices refer to the same size. Quotes that cannot be filled completely are
+    kept as partial fills and never promoted to executable prices.
     """
     def one(r):
         if not r.get("yes_token"):
@@ -1062,29 +1073,26 @@ def attach_books(rows, spend, workers=4, fee_rate: float = 0.04):
         try:
             yb, ya = book(r["yes_token"])
             nb, na = book(r["no_token"]) if r.get("no_token") else ([], [])
-        except Exception:
+        except Exception as exc:
+            r["book_error"] = f"{type(exc).__name__}"
             return
-        yv, _ = vwap(ya, spend)
-        nv, _ = vwap(na, spend)
-        r.update({"yes_vwap": yv, "no_vwap": nv,
-                  "yes_depth": depth(ya), "no_depth": depth(na),
-                  "yes_bid": yb[0][0] if yb else None,
-                  "no_ask_realtime": na[0][0] if na else None})
-        yd, nd = r["yes_depth"] or 0.0, r["no_depth"] or 0.0
-        r["sentiment"] = nd / (nd + yd) if nd + yd else None  # NO 侧挂单比例，1=全人压 NO
-        yb_price = yb[0][0] if yb else yv        # 报价不到的时用 vwap 顶替
-        na_price = na[0][0] if na else nv
-        if yb_price is not None and na_price is not None:
-            r["lock_spread"] = (yb_price + na_price) - 1.0
-        yp = r.get("yes_vwap") or r.get("yes_bid")
-        np_ = r.get("no_vwap") or r.get("no_ask_realtime")
-        if yp is not None:
-            r["yes_price"] = yp
-            r["yes_fee"] = fee_rate * yp * (1 - yp)
-        if np_ is not None:
-            r["no_price"] = np_
-            r["no_fee"] = fee_rate * np_ * (1 - np_)
-        r["market"] = r.get("market") or r.get("title", r["label"])
+        try:
+            info = analyze_books(yb, ya, nb, na, spend,
+                                 fee_per_share=fee_per_share, fee_rate=fee_rate,
+                                 discount_ticks=discount_ticks, tick_size=tick_size)
+        except ValueError as exc:
+            r["book_error"] = str(exc)
+            return
+        r.update(info)
+        r["yes_complete"] = info["yes_fill"]["complete"]
+        r["no_complete"] = info["no_fill"]["complete"]
+        r["yes_partial_vwap"] = info["yes_fill"]["partial_vwap"]
+        r["no_partial_vwap"] = info["no_fill"]["partial_vwap"]
+        r.pop("yes_fill", None)
+        r.pop("no_fill", None)
+        r["yes_price"] = r.get("yes_vwap")
+        r["no_price"] = r.get("no_vwap")
+        r["market"] = r.get("market") or r.get("title", r.get("label", ""))
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(one, rows))
@@ -1106,106 +1114,114 @@ def _market(r):
     return r.get("market") or r.get("title", "")
 
 
+def _cell(text):
+    return markdown_cell(text)
+
+
+def _p_basis(r):
+    return r.get("probability_basis") or "模型成员比例（未校准情景）"
+
+
 def _fee_ok(r, spend, fee_rate, side="yes") -> bool:
-    """Fee-drag veto: reject if taker fee > 2% of expected payoff (Polymarket tier)."""
-    fd = r.get(f"{side}_fee")
-    return fd is None or fd < 0.02 * spend
+    """Only a known fee can veto; unknown fee is not free: the table says gross only."""
+    fee = r.get(f"{side}_fee")
+    if fee is None:
+        return True
+    price = r.get(f"{side}_price") or 0.0
+    return bool(price) and fee <= 0.02 * price * spend
 
 
-def _price_band_ok(r, side="yes") -> bool:
-    """Favorite-longshot vetoes: drop ≤$0.10 and ≥$0.90 tails.
-
-    Historical data shows contracts at or below 10 cents lose >60% on average before
-    fees — the favorite-longshot bias. ≥$0.90 carries the mirror risk on the other side."""
-    pr = r.get(f"{side}_price")
-    return pr is None or 0.10 < pr < 0.90
-
-
-def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False, fee_rate=0.04):
+def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
+              discount_ticks=0, tick_size=None):
     def ok(r):
         sp = r.get("spread")
-        if sp is not None and sp > max_spread:
-            return False
-        return True
+        return sp is None or sp <= max_spread
+
+    def complete(r, side):
+        return bool(r.get(f"{side}_complete"))
 
     out = []
-    # ---- lock-trade / hedge section (yes_bid + no_ask < 1 by enough to clear fee) ----
-    locks = [r for r in rows
-             if r.get("lock_spread") is not None
-             and r["lock_spread"] < -0.005
-             and r["lock_spread"] < -0.5 * (r.get("fee_drag") or 0.0)]
-    if locks:
-        locks.sort(key=lambda r: r["lock_spread"])
-        out.append("## 无风险锁价｜双侧同买，锁定价差")
-        out.append("| 盘面 | 档位 | yes_bid | no_ask | 价差 | 锁定利润 | 依据 |")
-        out.append("|---|---|---|---|---|---|---|")
-        for r in locks[:top]:
-            yb = r.get("yes_bid") or 0.0
-            na = r.get("no_ask_realtime") or 0.0
-            out.append(f"| {_market(r)} | {r['label']} | {yb:.3f} | {na:.3f} | {r['lock_spread']:+.3f} "
-                       f"| {-r['lock_spread']:.3f} | ${r['yes_bid']- (1-(r.get('no_ask_realtime') or 0)):.2f} | "
-                       f"yes+no={yb+na:.3f}<1，费用 {r.get('fee_drag') or 0:.3f}/份 |")
+    # ---- equal-share YES+NO pair: only a fully filled ASK+ASK cost is shown, and
+    # only as a gross observation unless a verified per-share fee was supplied.
+    pairs = [r for r in rows if r.get("pair") and r["pair"].get("complete")]
+    if pairs:
+        pairs.sort(key=lambda r: -(r["pair"].get("gross_profit") or 0))
+        out.append("## 等份 YES+NO｜两腿 ASK 成本低于 1 的情形")
+        out.append("| 盘面 | 档位 | 等份数 | 两腿ASK成本 | 毛价差/份 | 净价差/份 | 费用状态 | 说明 |")
+        out.append("|---|---|---|---|---|---|---|---|")
+        for r in pairs[:top]:
+            pr = r["pair"]
+            gross = pr.get("gross_profit")
+            if gross is None or gross <= 0:
+                continue
+            net = pr.get("scenario_net_profit")
+            net_txt = "—" if net is None else f"{net / pr['shares_each']:+.3f}"
+            out.append(f"| {_cell(_market(r))} | {_cell(r['label'])} | {pr['shares_each']:.0f} "
+                       f"| {1 - gross / pr['shares_each']:.3f} | {gross / pr['shares_each']:+.3f} "
+                       f"| {net_txt} | {_cell(r.get('fee_status'))} | {_cell(pr.get('warning'))} |")
         out.append("")
-        top -= len(locks[:top])  # 留给其它类别
 
     if mode in ("yes", "both"):
-        cand = [r for r in rows if r.get("yes_vwap") and r["p_min"] - r["yes_vwap"] >= min_edge
-                and ok(r) and r.get("yes_depth", 0) >= 3 * spend
-                and _fee_ok(r, spend, fee_rate, "yes") and _price_band_ok(r, "yes")]
+        cand = [r for r in rows if r.get("yes_vwap") and complete(r, "yes")
+                and r["p_min"] - r["yes_vwap"] >= min_edge and ok(r)
+                and _fee_ok(r, spend, None, "yes")]
         cand.sort(key=lambda r: -(r["p_min"] - r["yes_vwap"]))
-        out.append("## 买 YES｜花小钱赌这一档会中")
-        out.append("| 盘面 | 市场 | 档位 | 模型给的概率 | 实际买入价 | 便宜多少 | 盘口深度 | 多空情绪 | 依据 |")
-        out.append("|---|---|---|---|---|---|---|---|---|---|")
+        out.append("## 候选 YES｜模型情景高于当前可成交价")
+        out.append("| 盘面 | 市场 | 档位 | 概率（依据） | 现价可成交 | 等待限价 | 便宜多少 | 撤单/失效 |")
+        out.append("|---|---|---|---|---|---|---|---|")
         for r in cand[:max(1, top)]:
-            sent = r.get("sentiment")
-            sent_txt = f"{sent:.0%}NO" if sent is not None else "-"
-            out.append(f"| {_market(r)} | {KIND_CN.get(r['kind'], r.get('kind',''))} | {r['label']}{_step_mark(r)} "
-                       f"| {r['p_min']:.0%}（乐观 {r['p_max']:.0%}） "
-                       f"| {r['yes_vwap']:.3f} | +{(r['p_min']-r['yes_vwap'])*100:.0f}pp "
-                       f"| ${r['yes_depth']:.0f} | {sent_txt} | {r['note']} |")
+            limit = r.get("yes_limit")
+            out.append(f"| {_cell(_market(r))} | {KIND_CN.get(r['kind'], r.get('kind', ''))} "
+                       f"| {_cell(r['label'])}{_step_mark(r)} "
+                       f"| {r['p_min']:.0%} vs {r['p_max']:.0%}（{_cell(_p_basis(r))}） "
+                       f"| {r['yes_vwap']:.3f} | {'—' if limit is None else f'{limit:.3f}'} "
+                       f"| {((r['p_min'] - r['yes_vwap']) * 100):+.0f}pp "
+                       f"| {_cell('报价变动/目标日开盘前重核' if limit is None else f'比现价低{discount_ticks}个tick；未成交即失效')} |")
         out.append("")
     if mode in ("no", "both"):
-        cand, fragile = [], []
+        cand = []
         for r in rows:
-            if not (r.get("no_vwap") and (1 - r["p_max"]) - r["no_vwap"] >= min_edge
-                    and ok(r) and r.get("no_depth", 0) >= 3 * spend
-                    and _fee_ok(r, spend, fee_rate, "no") and _price_band_ok(r, "no")):
+            if not (r.get("no_vwap") and complete(r, "no") and ok(r)
+                    and _fee_ok(r, spend, None, "no")):
                 continue
-            # 中心落在卖档上的 NO（steps <0.25）= 赌整体漂移不砸自己，0 策存留
-            if r.get("steps") is not None and r["steps"] < 0.25:
-                fragile.append(r)
+            if (1 - r["p_max"]) - r["no_vwap"] < min_edge:
                 continue
-            # 抗漂移门槛：±1.5 度朝该档漂移后仍要剩 5pp 边际，否则这是
-            # "一次普通预报误差就翻车"的相邻档 NO
-            if (1 - r.get("p_drift", 0.0)) - r["no_vwap"] < 0.05:
-                fragile.append(r)
-            else:
+            # A centre inside the sold bracket is the worst case: no margin at all.
+            if r.get("steps") is not None and r["steps"] <= 0:
+                r["research_only"] = True
+                r["note"] = (r.get("note", "") + "｜中心在卖档内，压力测试含零漂移").strip("｜")
                 cand.append(r)
+                continue
+            if (1 - r.get("p_stress", 0.0)) - r["no_vwap"] < 0.05:
+                r["research_only"] = True
+                r["note"] = (r.get("note", "") + "｜±1.5°压力后无边际").strip("｜")
+                cand.append(r)
+                continue
+            cand.append(r)
         cand.sort(key=lambda r: -((1 - r["p_max"]) - r["no_vwap"]))
-        out.append("## 买 NO｜高胜率，赌这一档不会中")
-        out.append("| 盘面 | 市场 | 档位 | 模型给的胜率 | 买入价 | 赔率 | 便宜多少 | 抗漂移胜率 | 盘口深度 | 多空情绪 | 依据 |")
-        out.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
-        shown = cand[:max(1, top)]
+        out.append("## 候选 NO｜赌这一档不会中（含压力测试）")
+        out.append("| 盘面 | 市场 | 档位 | 概率（依据） | 现价可成交 | 等待限价 | 赔率 | 压力后胜率 | 状态 |")
+        out.append("|---|---|---|---|---|---|---|---|---|")
+        shown = [r for r in cand if not r.get("research_only")][:max(1, top)]
         if risky:
-            shown = shown + fragile[:max(0, top - len(shown))]
+            shown += [r for r in cand if r.get("research_only")][:max(0, top - len(shown))]
+        hidden = [r for r in cand if r.get("research_only")]
+        if not shown:
+            out.append("今天没有通过压力测试的 NO 候选"
+                       + (f"（另有 {len(hidden)} 个观察档，加 --risky 查看）" if hidden else "。"))
         for r in shown:
             no_v = r["no_vwap"]
-            mark = " ⚠️脆弱" if r in fragile else ""
-            far = r.get("steps") is not None and r["steps"] >= 2.0
-            drift_txt = f"{1-r.get('p_drift',0):.0%}"
-            if far and r.get("p_stress") is not None:
-                drift_txt += f"（最坏{1-r['p_stress']:.0%}）"
-            sent = r.get("sentiment")
-            sent_txt = f"{sent:.0%}NO" if sent is not None else "-"
-            out.append(f"| {_market(r)} | {KIND_CN.get(r['kind'], r.get('kind',''))} | {r['label']}{_step_mark(r)}{mark} "
-                       f"| {1-r['p_max']:.0%}（保守 {1-r['p_min']:.0%}） "
-                       f"| {no_v:.3f} | {(1-no_v)/no_v:.2f}:1 | +{((1-r['p_max'])-no_v)*100:.0f}pp "
-                       f"| {drift_txt} | ${r['no_depth']:.0f} | {sent_txt} | {r['note']} |")
-        if fragile:
-            out.append(f"\n已过滤 {len(fragile)} 个漂移脆弱档（模型概率够，但 ±1.5°C 漂移就翻车"
-                       f"——10/24 华沙 6°、亚特兰大 70-71° 都是这类）。加 --risky 查看。")
-        out.append("\n抗漂移口径：距中心 <2 档 = ±1.5° 最坏情形（贴脸档铁律）；"
-                   "≥2 档 = 概率加权（叠加 0.75° 系统性漏估），括号里给最坏情形供参考。")
+            limit = r.get("no_limit")
+            stress = 1 - r.get("p_stress", 1.0)
+            status = "观察" if r.get("research_only") else "候选"
+            out.append(f"| {_cell(_market(r))} | {KIND_CN.get(r['kind'], r.get('kind', ''))} "
+                       f"| {_cell(r['label'])}{_step_mark(r)} "
+                       f"| {1 - r['p_max']:.0%} vs {1 - r['p_min']:.0%}（{_cell(_p_basis(r))}） "
+                       f"| {no_v:.3f} | {'—' if limit is None else f'{limit:.3f}'} "
+                       f"| {(1 - no_v) / no_v:.2f}:1 | {stress:.0%} | {status} |")
+        out.append("\n压力测试对每个 NO 都施加 ±0.5/1/1.5°C 全体成员平移（华氏 ×1.8），"
+                   "含零漂移；中心落在卖档内的候选只能观察。样本比例不等于校准胜率，"
+                   "全不命中也不代表 100% 保证。")
         out.append("")
     return "\n".join(out)
 
@@ -1377,6 +1393,11 @@ def bias_report() -> int:
 
 def settle(target: date) -> int:
     """Grade a finished date: actuals, winning bracket, and the model centre's miss."""
+    utc_today = datetime.now(ZoneInfo("UTC")).date()
+    if target >= utc_today:
+        print(f"{target} 尚未结束（UTC 今天 {utc_today}）：当地日仍在走，"
+              f"现在的极值不是最终结算值，本次不写入历史。", file=sys.stderr)
+        return 2
     merged, ids = [], set()
     for ev in discover(target) + discover(target, closed=True):
         if ev["id"] not in ids:
@@ -1384,8 +1405,8 @@ def settle(target: date) -> int:
             merged.append(ev)
     events = merged
     print(f"# {target} 结算核对（{len(events)} 个事件）\n")
-    print("| 城市 | 市场 | 实际 | 获胜档 | 模型中心（缓存） | 偏差 |")
-    print("|---|---|---|---|---|---|")
+    print("| 城市 | 市场 | 实际 | 获胜档 | 模型中心（缓存） | 偏差 | 备注 |")
+    print("|---|---|---|---|---|---|---|")
     obs_end = target - timedelta(days=1)
     obs_start = obs_end - timedelta(days=64)
     records = []
@@ -1397,14 +1418,14 @@ def settle(target: date) -> int:
             v = (hko_extract_month(target.year, target.month, col).get(target)
                  or hko_month(kind_key, target.year, target.month).get(target))
             if v is None:
-                print(f"| 香港 | {KIND_CN[kind]} | 天文台摘录未发布（滞后1-2天） | - | - | - |")
+                print(f"| 香港 | {KIND_CN[kind]} | 天文台摘录未发布（滞后1-2天） | - | - | - | 非最终，不进入历史 |")
                 continue
             winner, unit = _winner_label(ev, v, hk=True), "°C"
         else:
             hi, lo = settle_daily(code, STATIONS[code]["tz"], target)
             v = hi if kind == "high" else lo
             if v is None:
-                print(f"| {city_name(code)} | {KIND_CN[kind]} | 无观测数据 | - | - | - |")
+                print(f"| {city_name(code)} | {KIND_CN[kind]} | 无观测数据 | - | - | - | 非最终，不进入历史 |")
                 continue
             if ev["unit"] == "F":          # METAR obs are Celsius; the ladder is Fahrenheit
                 v = v * 9 / 5 + 32
@@ -1412,10 +1433,12 @@ def settle(target: date) -> int:
         centre = _cached_centre(code, kind, target, obs_start, obs_end, ev["unit"])
         miss = f"{v - centre:+.1f}" if centre is not None else "-"
         c_txt = f"{centre:.1f}" if centre is not None else "-"
-        print(f"| {city_name(code)} | {KIND_CN[kind]} | {v:.1f}{unit} | {winner} | {c_txt} | {miss} |")
+        note = "有扫描时中心" if centre is not None else "无扫描时中心，仅实际值"
+        print(f"| {city_name(code)} | {KIND_CN[kind]} | {v:.1f}{unit} | {winner} | {c_txt} | {miss} | {note} |")
         records.append({"d": target.isoformat(), "code": code, "city": city_name(code),
                         "kind": kind, "unit": ev["unit"], "actual": v, "winner": winner,
-                        "centre": centre})
+                        "centre": centre,
+                        "centre_source": "scan_cache" if centre is not None else None})
     _append_history(records)
     if records:
         print(f"\n已并入结算历史 {len(records)} 行 → {SETTLE_HISTORY.name}（--bias 看累计偏差回测）")
@@ -1425,7 +1448,8 @@ def settle(target: date) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Weather bracket scanner (routine-METAR basis).")
     ap.add_argument("--date", default="", help="Target local date YYYY-MM-DD (default: tomorrow UTC).")
-    ap.add_argument("--spend", type=float, default=20.0, help="USD per order for the VWAP check.")
+    ap.add_argument("--spend", type=float, default=20.0,
+                    help="每一边计划买入的份数（YES 和 NO 用同一数量配对）；不是美元总额。")
     ap.add_argument("--min-edge", type=float, default=0.04)
     ap.add_argument("--mode", choices=["yes", "no", "both"], default="both")
     ap.add_argument("--top", type=int, default=8)
@@ -1434,8 +1458,12 @@ def main() -> int:
                          "(e.g. KLGA,东京,香港). Cuts a cold scan from minutes to seconds.")
     ap.add_argument("--max-spread", type=float, default=1.5,
                     help="Reject brackets where the three model centres disagree by more than this (C or F).")
-    ap.add_argument("--fee-rate", type=float, default=0.04,
-                    help="Taker fee tier used for the fee-drag veto (0.07 crypto / 0.04 politics / 0 geopol).")
+    ap.add_argument("--fee-per-share", type=float, default=None,
+                    help="已知的每份费用（美元/概率单位）。不提供则费用未知，不能宣称净收益。")
+    ap.add_argument("--discount-ticks", type=int, default=0,
+                    help="等待限价：低于当前 ask 多少个 tick 的被动买入情景（0=不计算）。")
+    ap.add_argument("--tick-size", type=float, default=None,
+                    help="市场的价格 tick（如 0.001/0.01）。与 --discount-ticks 同时给才有意义。")
     ap.add_argument("--lookback", type=int, default=64, help="Days of history for bias/sigma.")
     ap.add_argument("--workers", type=int, default=4, help="Parallel stations (Open-Meteo rate limit).")
     ap.add_argument("--settle", default="",
@@ -1454,6 +1482,10 @@ def main() -> int:
         return settle(date.fromisoformat(args.settle))
     if args.bias:
         return bias_report()
+    today_local = datetime.now(ZoneInfo("UTC")).date()
+    if target <= today_local:
+        print(f"警告：{target} 的当地日可能尚未结束，结算/观测仍会变化；"
+              f"预报型结论只适用于未开始的目标日。", file=sys.stderr)
     obs_end = target - timedelta(days=1)
     obs_start = obs_end - timedelta(days=args.lookback)
 
@@ -1492,15 +1524,17 @@ def main() -> int:
     # only bother reading books for plausible candidates
     shortlist = [r for r in rows
                  if (r["p_min"] - (r["ask"] or 1) > -0.02) or ((1 - r["p_max"]) - (1 - (r["bid"] or 0)) > 0.02)]
-    attach_books(shortlist, args.spend, fee_rate=args.fee_rate)
+    attach_books(shortlist, args.spend, fee_per_share=args.fee_per_share,
+                 discount_ticks=args.discount_ticks, tick_size=args.tick_size)
 
     if args.json:
         print(json.dumps(shortlist, ensure_ascii=False, indent=1, default=str))
         return 0
 
-    print(f"\n# {target} 天气盘扫描  (${args.spend:.0f} 单量, 边际门槛 {args.min_edge*100:.0f}pp)\n")
+    print(f"\n# {target} 天气盘扫描  (每边 {args.spend:.0f} 份, 边际门槛 {args.min_edge*100:.0f}pp)\n")
     table = fmt_table(shortlist, args.spend, args.min_edge, args.mode, args.top,
-                      args.max_spread, risky=args.risky, fee_rate=args.fee_rate)
+                      args.max_spread, risky=args.risky,
+                      discount_ticks=args.discount_ticks, tick_size=args.tick_size)
     print(table if table.strip() else "没有过门槛的档位。")
     return 0
 
