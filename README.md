@@ -37,7 +37,7 @@ python skills/pm-edge/scripts/pm_scan.py --query "tweet,posts" --top 8
 ```bash
 python skills/pm-edge/scripts/pm_weather.py --date 2026-10-27 --top 10 --fee-per-share 0.0
 python skills/pm-edge/scripts/pm_weather.py --settle 2026-10-25
-python skills/pm-edge/scripts/pm_bias.py --help 2>/dev/null || python skills/pm-edge/scripts/pm_weather.py --bias
+python skills/pm-edge/scripts/pm_weather.py --bias                      # 累计偏差/中心档命中率
 ```
 
 回答的表长这样（列会随盘面变化）：
