@@ -815,13 +815,15 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
                     pathlib.Path(CACHE, f"asos_{c}_{obs_start}_{obs_end}.csv").write_text(
                         "\n".join(lines) + "\n", encoding="utf-8")
 
-    def guarded(fn, label, sts, cache_ok):
+    def guarded(fn_factory, label, sts, cache_ok):
+        def _do():
+            fn_factory(sts)
         try:
-            fn()
+            _do()
             return None
         except Exception as exc:
-            print(f"prewarm {label} 首次失败（{type(exc).__name__}），稍后重试", file=sys.stderr)
-            return (fn, label, sts, cache_ok)
+            print(f"prewarm {label} 首次失败（{type(exc).__name__}: {exc}），稍后重试", file=sys.stderr)
+            return (_do, label, sts, cache_ok)
 
     def have_prev(sts):
         return all(pathlib.Path(CACHE, f"prevparse_{st}_{obs_start}_{obs_end}.json").exists()
@@ -840,9 +842,9 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
     with ThreadPoolExecutor(max_workers=workers) as pool:
         jobs = []
         for zone, sts in groups.items():
-            jobs.append(pool.submit(guarded, prev_one, "前一天预报", sts, have_prev))
-            jobs.append(pool.submit(guarded, ens_one, "集合成员", sts, have_ens))
-        jobs.append(pool.submit(guarded, iem_one, "IEM 观测", codes, have_iem))
+            jobs.append(pool.submit(guarded, (lambda s, z=zone: prev_one(z, s)), "前一天预报", sts, have_prev))
+            jobs.append(pool.submit(guarded, (lambda s: ens_one(zone, s)), "集合成员", sts, have_ens))
+        jobs.append(pool.submit(guarded, (lambda s: iem_one(s)), "IEM 观测", codes, have_iem))
         failed = [r for r in (j.result() for j in jobs) if r]
 
     # 429 限流兜底：歇一口气，用更低的并发把失败的组重来一次
@@ -933,7 +935,7 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
         if ev["kind"] not in est:
             return rows
         e = est[ev["kind"]]
-        centre, sigma = e["official"], e["sigma"]
+        centre, sigma = e["official"], max(e["sigma"], 1.5)  # HKO ±1.5°C = 满分误差
         for mk in ev["markets"]:
             bd = hk_interval(mk.get("groupItemTitle"))
             if not bd:
@@ -1102,6 +1104,10 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False):
         for r in rows:
             if not (r.get("no_vwap") and (1 - r["p_max"]) - r["no_vwap"] >= min_edge
                     and ok(r) and r.get("no_depth", 0) >= 3 * spend):
+                continue
+            # 中心落在卖档上的 NO（steps <0.25）= 赌整体漂移不砸自己，0 策存留
+            if r.get("steps") is not None and r["steps"] < 0.25:
+                fragile.append(r)
                 continue
             # 抗漂移门槛：±1.5 度朝该档漂移后仍要剩 5pp 边际，否则这是
             # "一次普通预报误差就翻车"的相邻档 NO
