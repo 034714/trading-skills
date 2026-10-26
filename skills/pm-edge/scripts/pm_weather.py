@@ -843,7 +843,7 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
         jobs = []
         for zone, sts in groups.items():
             jobs.append(pool.submit(guarded, (lambda s, z=zone: prev_one(z, s)), "前一天预报", sts, have_prev))
-            jobs.append(pool.submit(guarded, (lambda s: ens_one(zone, s)), "集合成员", sts, have_ens))
+            jobs.append(pool.submit(guarded, (lambda s, z=zone: ens_one(z, s)), "集合成员", sts, have_ens))
         jobs.append(pool.submit(guarded, (lambda s: iem_one(s)), "IEM 观测", codes, have_iem))
         failed = [r for r in (j.result() for j in jobs) if r]
 
@@ -1046,13 +1046,22 @@ def _row(ev, mk, pmin, pmean, pmax, pr, pb, centre, sigma, note="", spread=None,
     }
 
 
-def attach_books(rows, spend, workers=4):
+def attach_books(rows, spend, workers=4, fee_rate: float = 0.04):
+    """Enrich rows with real YES/NO order-book data.
+
+    Generalised beyond weather: each row is keyed by `label` (the human-readable
+    market question, not just a bracket ladder) so the same path serves crypto
+    price, politics, pop-culture, etc. Two cross-market gates fold in here:
+
+    * fee_drag  = fee_rate * price * (1-price)   (Polymarket/Kalshi taker model)
+    * lock_spread = (yes_bid + no_ask) - 1.00     (<0 and clearing fee => risk-free hedge)
+    """
     def one(r):
-        if not r["yes_token"]:
+        if not r.get("yes_token"):
             return
         try:
             yb, ya = book(r["yes_token"])
-            nb, na = book(r["no_token"]) if r["no_token"] else ([], [])
+            nb, na = book(r["no_token"]) if r.get("no_token") else ([], [])
         except Exception:
             return
         yv, _ = vwap(ya, spend)
@@ -1061,6 +1070,21 @@ def attach_books(rows, spend, workers=4):
                   "yes_depth": depth(ya), "no_depth": depth(na),
                   "yes_bid": yb[0][0] if yb else None,
                   "no_ask_realtime": na[0][0] if na else None})
+        yd, nd = r["yes_depth"] or 0.0, r["no_depth"] or 0.0
+        r["sentiment"] = nd / (nd + yd) if nd + yd else None  # NO 侧挂单比例，1=全人压 NO
+        yb_price = yb[0][0] if yb else yv        # 报价不到的时用 vwap 顶替
+        na_price = na[0][0] if na else nv
+        if yb_price is not None and na_price is not None:
+            r["lock_spread"] = (yb_price + na_price) - 1.0
+        yp = r.get("yes_vwap") or r.get("yes_bid")
+        np_ = r.get("no_vwap") or r.get("no_ask_realtime")
+        if yp is not None:
+            r["yes_price"] = yp
+            r["yes_fee"] = fee_rate * yp * (1 - yp)
+        if np_ is not None:
+            r["no_price"] = np_
+            r["no_fee"] = fee_rate * np_ * (1 - np_)
+        r["market"] = r.get("market") or r.get("title", r["label"])
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(one, rows))
@@ -1078,7 +1102,26 @@ def _step_mark(r):
     return f" 距中心{s:.1f}档" + ("⚠" if s <= 1.25 else "")
 
 
-def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False):
+def _market(r):
+    return r.get("market") or r.get("title", "")
+
+
+def _fee_ok(r, spend, fee_rate, side="yes") -> bool:
+    """Fee-drag veto: reject if taker fee > 2% of expected payoff (Polymarket tier)."""
+    fd = r.get(f"{side}_fee")
+    return fd is None or fd < 0.02 * spend
+
+
+def _price_band_ok(r, side="yes") -> bool:
+    """Favorite-longshot vetoes: drop ≤$0.10 and ≥$0.90 tails.
+
+    Historical data shows contracts at or below 10 cents lose >60% on average before
+    fees — the favorite-longshot bias. ≥$0.90 carries the mirror risk on the other side."""
+    pr = r.get(f"{side}_price")
+    return pr is None or 0.10 < pr < 0.90
+
+
+def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False, fee_rate=0.04):
     def ok(r):
         sp = r.get("spread")
         if sp is not None and sp > max_spread:
@@ -1086,24 +1129,47 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False):
         return True
 
     out = []
+    # ---- lock-trade / hedge section (yes_bid + no_ask < 1 by enough to clear fee) ----
+    locks = [r for r in rows
+             if r.get("lock_spread") is not None
+             and r["lock_spread"] < -0.005
+             and r["lock_spread"] < -0.5 * (r.get("fee_drag") or 0.0)]
+    if locks:
+        locks.sort(key=lambda r: r["lock_spread"])
+        out.append("## 无风险锁价｜双侧同买，锁定价差")
+        out.append("| 盘面 | 档位 | yes_bid | no_ask | 价差 | 锁定利润 | 依据 |")
+        out.append("|---|---|---|---|---|---|---|")
+        for r in locks[:top]:
+            yb = r.get("yes_bid") or 0.0
+            na = r.get("no_ask_realtime") or 0.0
+            out.append(f"| {_market(r)} | {r['label']} | {yb:.3f} | {na:.3f} | {r['lock_spread']:+.3f} "
+                       f"| {-r['lock_spread']:.3f} | ${r['yes_bid']- (1-(r.get('no_ask_realtime') or 0)):.2f} | "
+                       f"yes+no={yb+na:.3f}<1，费用 {r.get('fee_drag') or 0:.3f}/份 |")
+        out.append("")
+        top -= len(locks[:top])  # 留给其它类别
+
     if mode in ("yes", "both"):
         cand = [r for r in rows if r.get("yes_vwap") and r["p_min"] - r["yes_vwap"] >= min_edge
-                and ok(r) and r.get("yes_depth", 0) >= 3 * spend]
+                and ok(r) and r.get("yes_depth", 0) >= 3 * spend
+                and _fee_ok(r, spend, fee_rate, "yes") and _price_band_ok(r, "yes")]
         cand.sort(key=lambda r: -(r["p_min"] - r["yes_vwap"]))
         out.append("## 买 YES｜花小钱赌这一档会中")
-        out.append("| 城市 | 市场 | 档位 | 模型给的概率 | 实际买入价 | 便宜多少 | 盘口深度 | 依据 |")
-        out.append("|---|---|---|---|---|---|---|---|")
-        for r in cand[:top]:
-            out.append(f"| {r['city']} | {KIND_CN[r['kind']]} | {r['label']}{_step_mark(r)} "
+        out.append("| 盘面 | 市场 | 档位 | 模型给的概率 | 实际买入价 | 便宜多少 | 盘口深度 | 多空情绪 | 依据 |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|")
+        for r in cand[:max(1, top)]:
+            sent = r.get("sentiment")
+            sent_txt = f"{sent:.0%}NO" if sent is not None else "-"
+            out.append(f"| {_market(r)} | {KIND_CN.get(r['kind'], r.get('kind',''))} | {r['label']}{_step_mark(r)} "
                        f"| {r['p_min']:.0%}（乐观 {r['p_max']:.0%}） "
                        f"| {r['yes_vwap']:.3f} | +{(r['p_min']-r['yes_vwap'])*100:.0f}pp "
-                       f"| ${r['yes_depth']:.0f} | {r['note']} |")
+                       f"| ${r['yes_depth']:.0f} | {sent_txt} | {r['note']} |")
         out.append("")
     if mode in ("no", "both"):
         cand, fragile = [], []
         for r in rows:
             if not (r.get("no_vwap") and (1 - r["p_max"]) - r["no_vwap"] >= min_edge
-                    and ok(r) and r.get("no_depth", 0) >= 3 * spend):
+                    and ok(r) and r.get("no_depth", 0) >= 3 * spend
+                    and _fee_ok(r, spend, fee_rate, "no") and _price_band_ok(r, "no")):
                 continue
             # 中心落在卖档上的 NO（steps <0.25）= 赌整体漂移不砸自己，0 策存留
             if r.get("steps") is not None and r["steps"] < 0.25:
@@ -1117,9 +1183,9 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False):
                 cand.append(r)
         cand.sort(key=lambda r: -((1 - r["p_max"]) - r["no_vwap"]))
         out.append("## 买 NO｜高胜率，赌这一档不会中")
-        out.append("| 城市 | 市场 | 档位 | 模型给的胜率 | 买入价 | 赔率 | 便宜多少 | 抗漂移胜率 | 盘口深度 | 依据 |")
-        out.append("|---|---|---|---|---|---|---|---|---|---|")
-        shown = cand[:top]
+        out.append("| 盘面 | 市场 | 档位 | 模型给的胜率 | 买入价 | 赔率 | 便宜多少 | 抗漂移胜率 | 盘口深度 | 多空情绪 | 依据 |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        shown = cand[:max(1, top)]
         if risky:
             shown = shown + fragile[:max(0, top - len(shown))]
         for r in shown:
@@ -1129,10 +1195,12 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False):
             drift_txt = f"{1-r.get('p_drift',0):.0%}"
             if far and r.get("p_stress") is not None:
                 drift_txt += f"（最坏{1-r['p_stress']:.0%}）"
-            out.append(f"| {r['city']} | {KIND_CN[r['kind']]} | {r['label']}{_step_mark(r)}{mark} "
+            sent = r.get("sentiment")
+            sent_txt = f"{sent:.0%}NO" if sent is not None else "-"
+            out.append(f"| {_market(r)} | {KIND_CN.get(r['kind'], r.get('kind',''))} | {r['label']}{_step_mark(r)}{mark} "
                        f"| {1-r['p_max']:.0%}（保守 {1-r['p_min']:.0%}） "
                        f"| {no_v:.3f} | {(1-no_v)/no_v:.2f}:1 | +{((1-r['p_max'])-no_v)*100:.0f}pp "
-                       f"| {drift_txt} | ${r['no_depth']:.0f} | {r['note']} |")
+                       f"| {drift_txt} | ${r['no_depth']:.0f} | {sent_txt} | {r['note']} |")
         if fragile:
             out.append(f"\n已过滤 {len(fragile)} 个漂移脆弱档（模型概率够，但 ±1.5°C 漂移就翻车"
                        f"——10/24 华沙 6°、亚特兰大 70-71° 都是这类）。加 --risky 查看。")
@@ -1366,6 +1434,8 @@ def main() -> int:
                          "(e.g. KLGA,东京,香港). Cuts a cold scan from minutes to seconds.")
     ap.add_argument("--max-spread", type=float, default=1.5,
                     help="Reject brackets where the three model centres disagree by more than this (C or F).")
+    ap.add_argument("--fee-rate", type=float, default=0.04,
+                    help="Taker fee tier used for the fee-drag veto (0.07 crypto / 0.04 politics / 0 geopol).")
     ap.add_argument("--lookback", type=int, default=64, help="Days of history for bias/sigma.")
     ap.add_argument("--workers", type=int, default=4, help="Parallel stations (Open-Meteo rate limit).")
     ap.add_argument("--settle", default="",
@@ -1422,7 +1492,7 @@ def main() -> int:
     # only bother reading books for plausible candidates
     shortlist = [r for r in rows
                  if (r["p_min"] - (r["ask"] or 1) > -0.02) or ((1 - r["p_max"]) - (1 - (r["bid"] or 0)) > 0.02)]
-    attach_books(shortlist, args.spend)
+    attach_books(shortlist, args.spend, fee_rate=args.fee_rate)
 
     if args.json:
         print(json.dumps(shortlist, ensure_ascii=False, indent=1, default=str))
@@ -1430,7 +1500,7 @@ def main() -> int:
 
     print(f"\n# {target} 天气盘扫描  (${args.spend:.0f} 单量, 边际门槛 {args.min_edge*100:.0f}pp)\n")
     table = fmt_table(shortlist, args.spend, args.min_edge, args.mode, args.top,
-                      args.max_spread, risky=args.risky)
+                      args.max_spread, risky=args.risky, fee_rate=args.fee_rate)
     print(table if table.strip() else "没有过门槛的档位。")
     return 0
 
