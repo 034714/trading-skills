@@ -1,4 +1,4 @@
 {
   "displayName": "Gate Stock-Perp Conditional Research",
-  "brief": "One command researches Gate stock-type USDT perpetuals (US/HK/index/AI names): execution snapshot (premium, hourly funding, OI, long/short accounts) + Yahoo underlying indicators + 1H intraday context + US session state; no default symbols, discover with --list; plain-language verdict and conditional cards first, read-only, no orders."
+  "brief": "Read-only Gate stock-perp research: discover tradable contracts, per-contract funding intervals, daily/4H/1H context and source times; manual online news/macro/earnings verification, separate structural and gross-R targets, holding horizons and expiry. No orders."
 }

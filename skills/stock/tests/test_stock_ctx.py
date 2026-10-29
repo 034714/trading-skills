@@ -250,5 +250,128 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("illustrative", card["sizing_status"])
 
 
+class EnhancementTests(unittest.TestCase):
+    setUp = RegressionTests.setUp
+    invoke = RegressionTests.invoke
+    fake_get = RegressionTests.fake_get
+    run_report = RegressionTests.run_report
+    # Realistic prompts are offline rule/script evaluations, NOT fresh-session model evals.
+    def test_prompt_discovery_not_old_holdings(self):
+        """提示：别只看我以前的持仓，主动找几个股票机会，成交活跃点。"""
+        self.contracts = [gate_contract(f"S{i:04}_USDT") for i in range(433)]
+        code, out, _ = self.run_report(["--list", "--json"])
+        listing = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(listing["count"], 433)
+        self.assertEqual(len(listing["rows"]), 433)
+        self.assertEqual(listing["rows"][-1]["contract"], "S0432_USDT")
+        with patch.object(ctx, "get", side_effect=self.fake_get):
+            listing = ctx.build_list("", sort="volume", top=4, min_volume=1)
+        self.assertEqual(listing["returned_count"], 4)
+        self.assertEqual(listing["count"], 433)
+
+    def test_prompt_news_earnings_not_price_proxy(self):
+        """提示：苹果财报和最近局势查一下，别只给我指标。"""
+        code, out, _ = self.run_report(["--symbols", "AAPL", "--json"])
+        sym = json.loads(out)["symbols"][0]
+        self.assertEqual(code, 0)
+        self.assertEqual(sym["event_research"]["earnings"], "not_checked")
+        text = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
+        for rule in ("发布时间", "查询时间", "403", "事实 → 解读 → 条件情景", "查不到不造数"):
+            self.assertIn(rule, text)
+
+    def test_prompt_target_horizon_and_invalidation(self):
+        """提示：NVDA想拿两三天，目标价、触发和失效怎么定？"""
+        self.contracts.append(gate_contract("NVDA_USDT"))
+        code, out, _ = self.run_report(["--symbols", "NVDA", "--auto", "--json"])
+        sym = json.loads(out)["symbols"][0]
+        card = sym["conditional_order_card"]
+        self.assertEqual(code, 0)
+        for field in ("structural_targets", "gross_R_targets", "holding_period", "entry_trigger", "valid_until_utc"):
+            self.assertIn(field, card)
+        self.assertIn("unconfirmed", card["entry_trigger"])
+        self.assertEqual(card["status"], "research_only_not_an_order")
+        self.assertIn("4h", sym["multi_timeframe"])
+        self.assertEqual(set(sym["data_quality"]), {"1d", "4h", "1h"})
+
+    def test_list_sort_missing_volume_and_trade_status(self):
+        self.contracts[0]["status"] = "suspended"
+        ticks = [{"contract": "AAPL_USDT", "volume_24h_quote": "90"}]
+        with patch.object(ctx, "fetch_contracts", return_value={c["name"]: c for c in self.contracts}), patch.object(ctx, "get", return_value=ticks):
+            rows = ctx.build_list("", sort="volume")["rows"]
+            self.assertEqual(rows[0]["contract"], "AAPL_USDT")
+            self.assertNotIn("ZHIPU_USDT", [r["contract"] for r in rows])
+            self.assertIsNone(rows[-1]["vol24h_quote"])
+            self.assertEqual(len(ctx.build_list("", min_volume=80)["rows"]), 1)
+            self.assertEqual(len(ctx.build_list("", underlying_only=True)["rows"]), 1)
+
+    def test_list_ticker_failure_not_silent(self):
+        with patch.object(ctx, "fetch_contracts", return_value={c["name"]: c for c in self.contracts}), patch.object(ctx, "get", side_effect=RuntimeError()):
+            listing = ctx.build_list("")
+        self.assertTrue(listing["warnings"])
+        self.assertTrue(all(r["vol24h_quote"] is None for r in listing["rows"]))
+
+    def test_list_invalid_options_before_network(self):
+        with patch.object(ctx, "get", side_effect=AssertionError("no network")):
+            for flags in (["--list", "--top", "0"], ["--list", "--min-volume", "nan"], ["--symbols", "AAPL", "--sort", "volume"]):
+                self.assertEqual(self.invoke(flags + ["--json"])[0], 2)
+
+    def test_yahoo_daily_and_short_final_hour_end(self):
+        start = int(datetime(2026, 7, 13, 19, 30, tzinfo=timezone.utc).timestamp())
+        end = int(datetime(2026, 7, 13, 20, 0, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(ctx.yahoo_bar_end(start, "1h", "AAPL"), end)
+        self.assertEqual(ctx.yahoo_bar_end(start - 21600, "1d", "AAPL"), end)
+        row = {"open_time": start * 1000, "close_time": end * 1000 - 1}
+        self.assertEqual(len(ctx.completed_yahoo_1h([row], datetime.fromtimestamp(end, timezone.utc))), 1)
+        self.assertEqual(len(ctx.completed_yahoo_1h([row], datetime.fromtimestamp(end - 1, timezone.utc))), 0)
+
+    def test_dst_actual_transition_hour(self):
+        self.assertEqual(ctx.ny_offset_minutes(datetime(2026, 3, 8, 6, 59, tzinfo=timezone.utc)), -300)
+        self.assertEqual(ctx.ny_offset_minutes(datetime(2026, 3, 8, 7, 0, tzinfo=timezone.utc)), -240)
+        self.assertEqual(ctx.ny_offset_minutes(datetime(2026, 11, 1, 5, 59, tzinfo=timezone.utc)), -240)
+        self.assertEqual(ctx.ny_offset_minutes(datetime(2026, 11, 1, 6, 0, tzinfo=timezone.utc)), -300)
+
+    def test_stale_gate_and_weekend_yahoo_clock(self):
+        now = datetime(2026, 7, 11, 15, tzinfo=timezone.utc)
+        end = int(datetime(2026, 7, 10, 20, tzinfo=timezone.utc).timestamp())
+        rows = [{"open_time": (end - 3600) * 1000, "close_time": end * 1000 - 1}]
+        self.assertFalse(ctx.bar_quality(rows, "yahoo_regular_hours", 3600, now)["stale"])
+        self.assertTrue(ctx.bar_quality(rows, "gate_24h", 3600, now)["stale"])
+        self.assertEqual(ctx.bar_quality([], "gate_24h", 3600, now)["status"], "unavailable")
+        monday = datetime(2026, 7, 13, 22, tzinfo=timezone.utc)
+        q = ctx.bar_quality(rows, "yahoo_regular_hours", 3600, monday)
+        self.assertTrue(q["stale"])
+        self.assertFalse(q["calendar_verified"])
+
+    def test_missing_multiplier_does_not_invent_oi(self):
+        contract = gate_contract("AAPL_USDT")
+        contract.pop("quanto_multiplier")
+        self.assertNotIn("open_interest_notional_usdt_approx", ctx.build_gate_snapshot(contract))
+
+    def test_structural_target_evidence_and_expiry(self):
+        self.contracts[0]["mark_price"] = "90"
+        code, out, _ = self.run_report(["--symbols", "ZHIPU", "--bias", "long", "--entry", "90", "--stop", "80", "--json"])
+        sym = json.loads(out)["symbols"][0]
+        card = sym["conditional_order_card"]
+        self.assertEqual(code, 0)
+        self.assertTrue(card["structural_targets"])
+        for target in card["structural_targets"]:
+            self.assertGreater(target["price"], 90)
+            self.assertIn("pivot_open_time_ms", target)
+            self.assertEqual(target["confirmation"], "left2_right2_completed_bars")
+        now = datetime.fromisoformat(sym["fetched_at_utc"]).timestamp()
+        expiry = datetime.fromisoformat(card["valid_until_utc"]).timestamp()
+        self.assertGreater(expiry, now)
+        self.assertLessEqual(expiry - now, 14400)
+        self.assertEqual(expiry % 14400, 0)
+
+    def test_funding_interval_and_units_label(self):
+        self.contracts[0]["funding_interval"] = 1800
+        code, out, _ = self.run_report(["--symbols", "ZHIPU", "--bias", "long", "--entry", "100", "--stop", "90"])
+        self.assertEqual(code, 0)
+        self.assertIn("/0.5h", out)
+        self.assertIn("非合约张数", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,7 +30,7 @@ YAHOO_MAP = {
 SHARED_WARNINGS = [
     "Gate股票永续为24/7单一场所定价：美股闭市与周末没有底层撮合锚定，指数价与标记价可因情绪大幅偏离，开盘跳空可使止损失效",
     "仅在Gate定价的标的（长鑫/宇树/智谱/OpenAI等）无外部行情锚定且历史短，指标可靠性弱；合约乘数、结算与退市规则未核验",
-    "财报与分红日历未自动获取，回复前必须人工核查标的财报日；财报跳空可击穿任何止损",
+    "新闻、宏观局势、财报与分红日历未自动获取，回复前必须人工联网核查；财报跳空可击穿任何止损",
     "EMA/RSI/ATR/摆点/资金费率/OI/多空账户数均为描述性状态，不是信号或胜率证据",
     "止损触发与平仓不保证成交；股票永续资金费率按合约funding_interval（常见1小时）结算，持仓成本须另算",
     "不覆盖Gate美股16×5实盘通道与任何券商实盘；Yahoo底层数据未经核验，美股假期未内置（以交易所公告为准）",
@@ -171,7 +171,7 @@ def ny_offset_minutes(dt):
                 if count == n:
                     return d
             d += timedelta(days=1)
-    return -240 if nth_sunday(3, 2) <= dt < nth_sunday(11, 1) else -300
+    return -240 if nth_sunday(3, 2) + timedelta(hours=7) <= dt < nth_sunday(11, 1) + timedelta(hours=6) else -300
 
 
 def ny_local(dt):
@@ -258,7 +258,7 @@ def yahoo_chart(symbol, interval, rng):
             values[field] = series[i] if i < len(series) else None
         if any(v is None for v in values.values()):
             continue
-        row = {"open_time": int(t) * 1000, "close_time": (int(t) + 3600) * 1000 - 1,
+        row = {"open_time": int(t) * 1000, "close_time": yahoo_bar_end(int(t), interval, symbol) * 1000 - 1,
                "open": float(values["open"]), "high": float(values["high"]),
                "low": float(values["low"]), "close": float(values["close"]),
                "volume": float((quote.get("volume") or [0] * len(ts))[i] or 0)}
@@ -270,21 +270,58 @@ def yahoo_chart(symbol, interval, rng):
     return rows, r.get("meta") or {}
 
 
+def yahoo_bar_end(t, interval, symbol):
+    # US daily closes at 16:00 NY; final regular hourly bar is only 30 minutes.
+    # Holidays/early closes are not asserted by this weekday clock.
+    if "." in symbol:
+        return t + (86400 if interval == "1d" else 3600)
+    dt = datetime.fromtimestamp(t, tz=timezone.utc)
+    local = ny_local(dt)
+    end = dt + timedelta(hours=16 - local.hour, minutes=-local.minute, seconds=-local.second)
+    return int(end.timestamp()) if interval == "1d" else min(t + 3600, int(end.timestamp()))
+
+
 def completed_yahoo_daily(rows, now):
-    """Drop the final daily bar while the US regular session that produces it is still running."""
-    if not rows:
-        return rows
-    today = ny_local(now).date()
-    last_day = ny_local(datetime.fromtimestamp(rows[-1]["open_time"] / 1000, tz=timezone.utc)).date()
-    if last_day == today and ny_session(now) in ("pre_market", "regular"):
-        return rows[:-1]
-    return rows
+    return [r for r in rows if yahoo_bar_end(r["open_time"] // 1000, "1d", "US") <= now.timestamp()]
 
 
 def completed_yahoo_1h(rows, now):
-    if rows and rows[-1]["close_time"] > now.timestamp() * 1000:
-        return rows[:-1]
-    return rows
+    return [r for r in rows if r["close_time"] < now.timestamp() * 1000]
+
+
+def bar_quality(rows, source, interval_s, now):
+    out = {"source": source, "completed_only": True, "bars": len(rows)}
+    if not rows:
+        return dict(out, status="unavailable")
+    end = rows[-1]["close_time"] / 1000 + 0.001
+    age = max(0, now.timestamp() - end)
+    if source.startswith("yahoo"):
+        local = ny_local(now)
+        day = local.replace(hour=16, minute=0, second=0, microsecond=0)
+        if local < day:
+            day -= timedelta(days=1)
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
+        expected = (now - (local - day)).timestamp()
+        if interval_s == 3600 and ny_session(now) == "regular":
+            expected = now.timestamp() - 3600
+        stale = end < expected - 900
+    else:
+        stale = age > interval_s * 1.5
+    return dict(out, last_open_time_ms=rows[-1]["open_time"], last_close_time_ms=rows[-1]["close_time"],
+                age_seconds=round(age), stale=stale,
+                status="stale_or_calendar_exception" if stale and source.startswith("yahoo") else "stale" if stale else "within_clock_window",
+                calendar_verified=False if source.startswith("yahoo") else None)
+
+
+def timeframe_state(rows, source):
+    if len(rows) < 50:
+        return {"source": source, "note": "unavailable_or_insufficient", "bars": len(rows)}
+    closes = [r["close"] for r in rows]
+    e20, e50 = ema(closes, 20), ema(closes, 50)
+    return {"source": source, "bars": len(rows), "close": sig(closes[-1]),
+            "rsi14": round(rsi(closes), 1), "ema20": sig(e20), "ema50": sig(e50),
+            "state": "above" if closes[-1] > e20 > e50 else "below" if closes[-1] < e20 < e50 else "mixed"}
 
 
 def build_indicators(rows, source, since_ms=None):
@@ -330,8 +367,8 @@ def build_gate_snapshot(c):
     if mark and index:
         snap["mark_vs_index_pct"] = round((mark - index) / index * 100, 2)
     pos = snap["position_size_contracts"]
-    mult = snap["quanto_multiplier"] or 1
-    if pos and mark:
+    mult = snap["quanto_multiplier"]
+    if pos and mark and mult and mult > 0:
         snap["open_interest_notional_usdt_approx"] = sig(pos * mult * mark)
     return snap
 
@@ -352,11 +389,12 @@ def build_symbol_report_full(args, symbol, now):
         usd = "." not in yahoo_symbol
         try:
             daily_raw, meta = yahoo_chart(yahoo_symbol, "1d", "2y" if usd else "1y")
-            daily = completed_yahoo_daily(daily_raw, now)
+            daily = completed_yahoo_daily(daily_raw, now) if usd else [r for r in daily_raw if r["close_time"] < now.timestamp() * 1000]
             if len(daily) < 15:
                 raise ValueError("Insufficient Yahoo daily history")
             yahoo_block = {"symbol": yahoo_symbol, "currency": meta.get("currency"),
                            "last": _num(meta.get("regularMarketPrice")), "bars": len(daily),
+                           "price_time_unix": meta.get("regularMarketTime"),
                            "role": "primary_usd_underlying" if usd else "context_only_non_usd_underlying"}
             yahoo_daily = daily
         except Exception as exc:
@@ -379,7 +417,7 @@ def build_symbol_report_full(args, symbol, now):
 
     four_h = gate_klines(name, "4h", 300, now)
     highs, lows = pivots(four_h)
-    last_close = indicators["last_close"]
+    last_close = snap.get("mark_price") or indicators["last_close"]
 
     mtf = {}
     one_h, mtf_source = None, None
@@ -389,18 +427,19 @@ def build_symbol_report_full(args, symbol, now):
             one_h = completed_yahoo_1h(one_h_raw, now)
             mtf_source = "yahoo_regular_hours"
         except Exception:
+            warnings.append("Yahoo 1H不可用，回退Gate 24/7；两种时钟不可当作同一序列")
             one_h = None
     if not one_h or len(one_h) < 50:
         one_h = gate_klines(name, "1h", 300, now)
         mtf_source = "gate_24h"
-    if len(one_h) >= 50:
-        closes_1h = [r["close"] for r in one_h]
-        e20, e50 = ema(closes_1h, 20), ema(closes_1h, 50)
-        state = ("above" if closes_1h[-1] > e20 > e50 else "below" if closes_1h[-1] < e20 < e50 else "mixed")
-        mtf["1h"] = {"source": mtf_source, "close": sig(closes_1h[-1]), "rsi14": round(rsi(closes_1h), 1),
-                     "ema20": sig(e20), "ema50": sig(e50), "state": state}
-    else:
-        mtf["1h"] = {"note": "unavailable_or_insufficient"}
+    mtf["1h"] = timeframe_state(one_h, mtf_source)
+    mtf["4h"] = timeframe_state(four_h, "gate_24h")
+    quality = {"1d": bar_quality(ind_rows, ind_source, 86400, now),
+               "4h": bar_quality(four_h, "gate_24h", 14400, now),
+               "1h": bar_quality(one_h, mtf_source, 3600, now)}
+    for period, q in quality.items():
+        if q.get("stale") or q["status"] == "unavailable":
+            warnings.append(f"{period}数据陈旧或缺失（Yahoo也可能是假期/提前收盘）；重查前不升级为可执行")
     nearest = None
     for price, kind in [(p[1], "high") for p in highs] + [(p[1], "low") for p in lows]:
         if nearest is None or abs(price - last_close) < abs(nearest[0] - last_close):
@@ -431,11 +470,12 @@ def build_symbol_report_full(args, symbol, now):
     atr_value = indicators["atr14_simple_mean"]
     cards = []
     if args.auto:
+        daily_close = indicators["last_close"]
         e50v, e200v, e20v = indicators.get("ema50"), indicators.get("ema200"), indicators.get("ema20")
         if e200v is not None and e50v is not None:
-            biases = ["long"] if last_close > e50v > e200v else ["short"] if last_close < e50v < e200v else ["long", "short"]
+            biases = ["long"] if daily_close > e50v > e200v else ["short"] if daily_close < e50v < e200v else ["long", "short"]
         elif e50v is not None and e20v is not None:
-            biases = ["long"] if last_close > e20v > e50v else ["short"] if last_close < e20v < e50v else ["long", "short"]
+            biases = ["long"] if daily_close > e20v > e50v else ["short"] if daily_close < e20v < e50v else ["long", "short"]
         else:
             biases = ["long", "short"]
         for bias in biases:
@@ -448,12 +488,29 @@ def build_symbol_report_full(args, symbol, now):
             if scenario.stop <= 0 or scenario.stop == scenario.entry:
                 continue
             card = conditional_card(scenario, atr_value)
-            card["basis"] = f"{ind_source}指标状态情景，非预测；入场为最新完成K线收盘，非实时"
+            card["basis"] = f"{ind_source}指标状态情景，非预测；入场为Gate标记价快照参考，非限价指令；ATR来自指标层，不是自动止损下限"
             card["validity"] = "下一根4H收盘重审；财报日与时段跳空未核查前不升级为可执行"
             cards.append(card)
 
+    if not cards:
+        cards = [conditional_card(args, atr_value)]
+    expiry = datetime.fromtimestamp((int(now.timestamp()) // 14400 + 1) * 14400, tz=timezone.utc).isoformat()
+    for card in cards:
+        entry, bias = card.get("entry"), card.get("bias")
+        candidates = highs if bias == "long" else lows if bias == "short" else []
+        targets = [{"price": sig(price), "pivot_open_time_ms": t, "source": "gate_4h_confirmed_pivot",
+                    "confirmation": "left2_right2_completed_bars"}
+                   for t, price in candidates if entry and (price > entry if bias == "long" else price < entry)]
+        targets.sort(key=lambda item: abs(item["price"] - entry))
+        card.update(structural_targets=targets[:3], valid_until_utc=expiry,
+                    entry_trigger="unconfirmed: require completed 1H break/retest with named level and invalidation",
+                    holding_period="intraday 1H/4H; multi-day requires daily structure and event review",
+                    target_note="pivots are candidate obstacles, not forecasts; gross_R_targets are arithmetic only",
+                    event_review_status="not_checked", data_quality_blocked=any(q.get("stale") or q["status"] == "unavailable" for q in quality.values()))
     return {"symbol": symbol, "gate_contract": name, "fetched_at_utc": now.isoformat(),
             "us_equity_session": ny_session(now),
+            "session_assessment": {"basis": "weekday_clock_only", "holiday_and_early_close_verified": False},
+            "data_quality": quality, "event_research": {"status": "not_checked", "news": "not_checked", "earnings": "not_checked", "macro": "not_checked"},
             "gate": snap, "underlying": yahoo_block,
             "indicators": indicators,
             "pivots_4h_gate": {"last_confirmed_high": sig(highs[-1][1]) if highs else None,
@@ -474,6 +531,10 @@ def parser():
     ap.add_argument("--symbols", default="", help="Comma list, required (no default), max 4, e.g. CXMT,UNITREE,ZHIPU")
     ap.add_argument("--list", nargs="?", const="", default=None, metavar="FILTER",
                     help="List Gate stock contracts (contract_type=stocks); optional substring filter, bare --list lists all")
+    ap.add_argument("--sort", choices=["name", "volume"], default="name", help="List order; volume descending, missing last")
+    ap.add_argument("--top", type=int, help="Explicit list row limit; default unlimited")
+    ap.add_argument("--min-volume", type=float, default=0, help="Minimum 24h quote turnover; not book depth")
+    ap.add_argument("--underlying-only", action="store_true", help="List verified USD underlying mappings only")
     ap.add_argument("--tranches", type=int, default=3, help="Equal-weight entry ladder size, 1-5, default 3")
     ap.add_argument("--bias", choices=["long", "short", "neutral"])
     ap.add_argument("--auto", action="store_true", help="Conditional EMA-state scenarios from indicator layer")
@@ -484,6 +545,12 @@ def parser():
 
 
 def validate(args):
+    if args.top is not None and args.top < 1:
+        raise ValueError("top must be positive")
+    if not math.isfinite(args.min_volume) or args.min_volume < 0:
+        raise ValueError("min-volume must be finite and nonnegative")
+    if args.list is None and (args.top is not None or args.min_volume or args.underlying_only or args.sort != "name"):
+        raise ValueError("list filters require --list")
     if args.list is not None:
         args.symbol_list = []
         return
@@ -545,27 +612,39 @@ def conditional_card(args, atr_value=None):
     return card
 
 
-def build_list(filter_str):
+def build_list(filter_str, sort="name", top=None, min_volume=0, underlying_only=False):
     contracts = fetch_contracts()
     tickers = {}
+    warnings = []
     try:
         for t in get(f"{GATE}/futures/usdt/tickers"):
             if isinstance(t, dict) and t.get("contract"):
                 tickers[t["contract"]] = t
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.append(f"24h turnover unavailable: {type(exc).__name__}; missing is not zero")
     rows = []
     for name, c in sorted(contracts.items()):
         if c.get("contract_type") != "stocks":
             continue
         if filter_str and filter_str.upper() not in name:
             continue
+        if c.get("status") != "trading" or c.get("in_delisting"):
+            continue
+        underlying = YAHOO_MAP.get(name.removesuffix("_USDT"))
+        if underlying_only and (not underlying or "." in underlying):
+            continue
         t = tickers.get(name, {})
+        volume = _num(t.get("volume_24h_quote"))
+        if min_volume and (volume is None or volume < min_volume):
+            continue
         rows.append({"contract": name, "mark": _num(c.get("mark_price")),
                      "vol24h_quote": _num(t.get("volume_24h_quote")),
                      "lev_max": _num(c.get("leverage_max")),
                      "yahoo_underlying": YAHOO_MAP.get(name.removesuffix("_USDT"))})
-    return {"filter": filter_str, "count": len(rows), "rows": rows[:120],
+    if sort == "volume":
+        rows.sort(key=lambda r: (r["vol24h_quote"] is None, -(r["vol24h_quote"] or 0), r["contract"]))
+    return {"filter": filter_str, "count": len(rows), "returned_count": len(rows if top is None else rows[:top]),
+            "rows": rows if top is None else rows[:top], "warnings": warnings, "sort": sort,
             "note": "contract_type=stocks 的 Gate USDT 永续；yahoo_underlying 为空表示无已验证的交易所底层"}
 
 
@@ -602,7 +681,7 @@ def format_symbol_human(report):
     fund = g.get("funding", {})
     rate = fund.get("rate")
     interval_h = (fund.get("interval_s") or 0) / 3600
-    fund_text = f"{rate * 100:.4f}%/{interval_h:.0f}h" if rate is not None and interval_h else "n/a"
+    fund_text = f"{rate * 100:.4f}%/{interval_h:g}h" if rate is not None and interval_h else "n/a"
     oi = g.get("open_interest_notional_usdt_approx")
     oi_text = f"${sig(oi / 1e6)}M" if oi else "n/a"
     la, sa = g.get("long_accounts"), g.get("short_accounts")
@@ -626,7 +705,9 @@ def format_symbol_human(report):
         if gp is not None:
             base += f" | Gate vs 底层 {gp:+.2f}%"
         lines.append(base)
-    lines.append(f"美股时段：{report['us_equity_session']}")
+    lines.append(f"美股时段：{report['us_equity_session']}（仅工作日时钟；假期/提前收盘未核验）")
+    for period, q in report.get("data_quality", {}).items():
+        lines.append(f"{period} 源K线 {_ms_to_str(q.get('last_open_time_ms'))}–{_ms_to_str(q.get('last_close_time_ms'))} | {q['source']} | {q['status']}")
     ind = report["indicators"]
     parts = [f"来源 {ind['source']}", f"收盘 {ind['last_close']}（{ind['bars']}根）"]
     for k in ("ema20", "ema50", "ema200"):
@@ -650,8 +731,9 @@ def format_symbol_human(report):
                   if pivot else "无最近摆点")
     flags_text = "、".join(m.get("intraday_flags", [])) or "-"
     lines.append(f"多周期 {h1_text} | {pivot_text} | 日内标记: {flags_text}")
+    lines.append(f"4H状态 {m.get('4h', {}).get('state', 'unavailable')} | 新闻/宏观/财报：未核查")
     for w in report.get("warnings", []):
-        lines.append(f"⚠ {w}")
+        lines.append(f"警告 {w}")
     cards = [report["conditional_order_card"]] + report.get("alternative_conditional_cards", [])
     for card in cards:
         lines.append(f"-- 卡（{card['bias']}，研究草案非订单）--")
@@ -661,7 +743,9 @@ def format_symbol_human(report):
         lines.append(f"entry {card.get('entry')} | stop {card.get('stop_trigger')}"
                      f" | R1/R2/R3 {card.get('gross_R_targets', {}).get('1')}/{card.get('gross_R_targets', {}).get('2')}"
                      f"/{card.get('gross_R_targets', {}).get('3')}"
-                     f" | 每$100风险 {card.get('units_per_100_usd_risk_example')} 张")
+                     f" | 每$100风险 {card.get('units_per_100_usd_risk_example')} 底层单位（非合约张数）")
+        lines.append(f"结构候选目标 {card.get('structural_targets', [])}（非R倍数预测） | 到期 {card.get('valid_until_utc')}")
+        lines.append(f"触发 {card.get('entry_trigger')} | 周期 {card.get('holding_period')}")
         ladder = card.get("tranche_ladder")
         if ladder:
             lines.append(f"分批 {ladder['levels']}（等权，均价 {ladder['avg_entry']}，共用失效价）")
@@ -677,7 +761,7 @@ def main(argv=None):
         args = parser().parse_args(argv)
         validate(args)
         if args.list is not None:
-            listing = build_list(args.list)
+            listing = build_list(args.list, args.sort, args.top, args.min_volume, args.underlying_only)
             if json_mode:
                 print(json.dumps(listing, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
             else:
