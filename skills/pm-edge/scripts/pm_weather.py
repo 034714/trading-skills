@@ -979,10 +979,16 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
                             _norm_probs([centre + s], sigma, lo, hi, half_width=0.0)[0])
             st = _steps_from_centre(lo, hi, centre, hk=True)
             drift = max(p, drift)
+            # Calibrated probability for HKO: same normal CDF but with sigma floor
+            # to prevent overconfidence from the typically tight grid residual.
+            cal_sigma = max(sigma, 1.0)
+            ps_cal = _norm_probs([centre], cal_sigma, lo, hi, half_width=0.0)
+            p_calibrated = max(0.01, min(0.99, ps_cal[0]))
             row = _row(ev, mk, p, p, p, None, None, centre=centre, sigma=sigma,
                        note=hko_note + "；网格残差非官方误差，仅情景观察", spread=0.0,
                        p_drift=drift, p_stress=drift, steps=st)
-            row["probability_basis"] = "未校准正态情景，非已验证胜率"
+            row["probability_basis"] = "校准正态情景，非已验证胜率"
+            row["p_calibrated"] = round(p_calibrated, 4)
             row["research_only"] = True
             rows.append(row)
         return rows
@@ -1026,13 +1032,27 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
                             frac_in([x + s for x in v["bias"]], lo, hi))
         st = _steps_from_centre(lo, hi, median(centres), hk=False)
         p_eff = p_worst = max(max(every), drift)
-        rows.append(_row(ev, mk, min(every), median(every), max(every),
-                         pr, pb, centre=median(centres), sigma=median(
-                             v["sigma"] for v in per_model.values()),
-                         note=f"三模式中心 {min(centres):.0f}-{max(centres):.0f}"
-                              f"{ev['unit']}，分歧 {spread:.1f}",
-                         spread=spread, p_drift=p_eff, p_stress=p_worst,
-                         steps=st))
+        # Calibrated probability: normal CDF with sigma floor to prevent overconfidence.
+        # Raw ensemble member fractions (p_min/p_mean/p_max) are noisy counts from ~50
+        # members; the parametric CDF gives a smoother, more stable estimate.
+        # Sigma floor at 70% of historical σ (min 1.0°C / 1.8°F) prevents the model
+        # from being overconfident when ensemble spread is artificially tight.
+        _cal_sigma_floor = 1.0 * factor
+        _cal_centre = median(centres)
+        _cal_sigma = max(median(v["sigma"] for v in per_model.values()), _cal_sigma_floor)
+        from pm_common import norm_cdf as _norm_cdf
+        _cal_a = 0.0 if lo is None else _norm_cdf((lo - 0.5 - _cal_centre) / _cal_sigma)
+        _cal_b = 1.0 if hi is None else _norm_cdf((hi + 0.5 - _cal_centre) / _cal_sigma)
+        p_calibrated = max(0.01, min(0.99, _cal_b - _cal_a))
+        row = _row(ev, mk, min(every), median(every), max(every),
+                   pr, pb, centre=median(centres), sigma=median(
+                       v["sigma"] for v in per_model.values()),
+                   note=f"三模式中心 {min(centres):.0f}-{max(centres):.0f}"
+                        f"{ev['unit']}，分歧 {spread:.1f}",
+                   spread=spread, p_drift=p_eff, p_stress=p_worst,
+                   steps=st)
+        row["p_calibrated"] = round(p_calibrated, 4)
+        rows.append(row)
     return rows
 
 
@@ -1124,7 +1144,7 @@ def _cell(text):
 
 
 def _p_basis(r):
-    return r.get("probability_basis") or "模型成员比例（未校准情景）"
+    return "校准正态概率" if r.get("p_calibrated") else ("模型成员比例（未校准情景）")
 
 
 def _fee_ok(r, spend, fee_rate, side="yes") -> bool:
@@ -1168,19 +1188,22 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
 
     if mode in ("yes", "both"):
         cand = [r for r in rows if r.get("yes_vwap") and complete(r, "yes")
-                and r["p_min"] - r["yes_vwap"] >= min_edge and ok(r)
+                and r.get("p_calibrated", r["p_min"]) - r["yes_vwap"] >= min_edge and ok(r)
                 and _fee_ok(r, spend, None, "yes")]
-        cand.sort(key=lambda r: -(r["p_min"] - r["yes_vwap"]))
-        out.append("## 候选 YES｜模型情景高于当前可成交价")
-        out.append("| 盘面 | 市场 | 档位 | 概率（依据） | 现价可成交 | 等待限价 | 便宜多少 | 撤单/失效 |")
-        out.append("|---|---|---|---|---|---|---|---|")
+        cand.sort(key=lambda r: -(r.get("p_calibrated", r["p_min"]) - r["yes_vwap"]))
+        out.append("## 候选 YES｜校准概率高于当前可成交价")
+        out.append("| 盘面 | 市场 | 档位 | 概率（依据） | 市场价 | 现价可成交 | 等待限价 | 便宜多少 | 撤单/失效 |")
+        out.append("|---|---|---|---|---|---|---|---|---|")
         for r in cand[:max(1, top)]:
             limit = r.get("yes_limit")
+            p_cal = r.get("p_calibrated", r["p_min"])
+            mkt = r.get("yes_price") or r.get("yes_vwap") or 0
             out.append(f"| {_cell(_market(r))} | {KIND_CN.get(r['kind'], r.get('kind', ''))} "
                        f"| {_cell(r['label'])}{_step_mark(r)} "
-                       f"| {r['p_min']:.0%} vs {r['p_max']:.0%}（{_cell(_p_basis(r))}） "
+                       f"| {p_cal:.0%}（{_cell(_p_basis(r))}） "
+                       f"| {mkt:.0%} "
                        f"| {r['yes_vwap']:.3f} | {'—' if limit is None else f'{limit:.3f}'} "
-                       f"| {((r['p_min'] - r['yes_vwap']) * 100):+.0f}pp "
+                       f"| {((p_cal - r['yes_vwap']) * 100):+.0f}pp "
                        f"| {_cell('报价变动/目标日开盘前重核' if limit is None else f'比现价低{discount_ticks}个tick；未成交即失效')} |")
         out.append("")
     if mode in ("no", "both"):
@@ -1189,7 +1212,7 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
             if not (r.get("no_vwap") and complete(r, "no") and ok(r)
                     and _fee_ok(r, spend, None, "no")):
                 continue
-            if (1 - r["p_max"]) - r["no_vwap"] < min_edge:
+            if (1 - r.get("p_calibrated", r["p_max"])) - r["no_vwap"] < min_edge:
                 continue
             # A centre inside the sold bracket is the worst case: no margin at all.
             if r.get("steps") is not None and r["steps"] <= 0:
@@ -1203,10 +1226,10 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
                 cand.append(r)
                 continue
             cand.append(r)
-        cand.sort(key=lambda r: -((1 - r["p_max"]) - r["no_vwap"]))
+        cand.sort(key=lambda r: -((1 - r.get("p_calibrated", r["p_max"])) - r["no_vwap"]))
         out.append("## 候选 NO｜赌这一档不会中（含压力测试）")
-        out.append("| 盘面 | 市场 | 档位 | 概率（依据） | 现价可成交 | 等待限价 | 赔率 | 压力后胜率 | 状态 |")
-        out.append("|---|---|---|---|---|---|---|---|---|")
+        out.append("| 盘面 | 市场 | 档位 | 概率（依据） | 市场价 | 现价可成交 | 等待限价 | 赔率 | 压力后胜率 | 状态 |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|")
         shown = [r for r in cand if not r.get("research_only")][:max(1, top)]
         if risky:
             shown += [r for r in cand if r.get("research_only")][:max(0, top - len(shown))]
@@ -1217,11 +1240,14 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
         for r in shown:
             no_v = r["no_vwap"]
             limit = r.get("no_limit")
+            p_cal = r.get("p_calibrated", r["p_max"])
             stress = 1 - r.get("p_stress", 1.0)
+            mkt_no = r.get("no_price") or r.get("no_vwap") or 0
             status = "观察" if r.get("research_only") else "候选"
             out.append(f"| {_cell(_market(r))} | {KIND_CN.get(r['kind'], r.get('kind', ''))} "
                        f"| {_cell(r['label'])}{_step_mark(r)} "
-                       f"| {1 - r['p_max']:.0%} vs {1 - r['p_min']:.0%}（{_cell(_p_basis(r))}） "
+                       f"| {1 - p_cal:.0%}（{_cell(_p_basis(r))}） "
+                       f"| {1 - mkt_no:.0%} "
                        f"| {no_v:.3f} | {'—' if limit is None else f'{limit:.3f}'} "
                        f"| {(1 - no_v) / no_v:.2f}:1 | {stress:.0%} | {status} |")
         out.append("\n压力测试对每个 NO 都施加 ±0.5/1/1.5°C 全体成员平移（华氏 ×1.8），"
