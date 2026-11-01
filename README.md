@@ -8,6 +8,8 @@
 
 ## 安装
 
+从 [Releases](https://github.com/034714/trading-skills/releases) 的 **Assets** 下载所需的 `pm-edge.zip`、`trade.zip` 或 `stock.zip`，解压后将对应 skill 目录导入客户端（若支持目录导入），或复制到下述技能目录。每个 skill 根目录应直接包含 `SKILL.md`，避免多套一层目录。GitHub 自动生成的 **Source code (zip/tar.gz)** 是整个仓库源码，不是单个 skill 安装包；若下载源码，请使用其中 `skills/` 下对应目录。
+
 将 `skills/pm-edge`、`skills/trade` 和 `skills/stock` 复制到助手支持的 skill 目录，例如支持该路径的客户端使用 `~/.agents/skills/`；MiMo Desktop 可使用 `~/.config/mimocode/skills/`。具体路径以客户端文档为准，安装后确认已发现技能，不要同时安装同名的多份副本。
 
 直接运行脚本需要 Python 3.10+；脚本使用标准库，离线测试需安装 `pytest`。从仓库根目录运行下方命令；参数以脚本 `--help` 为准。取数需要访问各公开接口，不需要交易账户密钥。

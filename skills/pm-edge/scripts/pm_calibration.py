@@ -44,6 +44,67 @@ def append(path: str, record: dict):
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def valid_probability(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and 0 <= value <= 1)
+
+
+def timestamp(value):
+    """Require an explicit timezone; never guess local time for evidence."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def temporal_evidence(row):
+    """Self-reported ordering only, not proof of historical availability."""
+    try:
+        cutoff = timestamp(row["available_cutoff_at"])
+        forecast = timestamp(row["predicted_at"])
+        logged = timestamp(row["logged_at"])
+        resolved = timestamp(row["resolved_at"])
+        return cutoff <= forecast <= logged < resolved
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def score(rows):
+    resolved = [r for r in rows if r.get("outcome") in ("yes", "no")]
+    valid = [r for r in resolved if valid_probability(r.get("p"))]
+    paired = [r for r in valid if valid_probability(r.get("price"))]
+
+    def brier(sample, key):
+        return sum((r[key] - (r["outcome"] == "yes")) ** 2 for r in sample) / len(sample)
+
+    print("描述性评分（非正式无泄漏验证）；Brier 越低越好。")
+    print(f"resolved={len(resolved)}  valid_p={len(valid)}  excluded_p={len(resolved) - len(valid)}")
+    if not valid:
+        print("no valid resolved records yet; Brier and calibration need valid probabilities and outcomes")
+    else:
+        print(f"all_valid_n={len(valid)}  Brier(yours)={brier(valid, 'p'):.4f}")
+    print(f"paired_n={len(paired)}  excluded_missing_or_invalid_price={len(valid) - len(paired)}")
+    if paired:
+        model, market = brier(paired, "p"), brier(paired, "price")
+        print(f"paired Brier(yours)={model:.4f}  Brier(market price)={market:.4f}")
+        print(f"skill={1 - model / market:+.1%}" if market > 0 else "skill=undefined (market Brier is zero)")
+    evidence = sum(temporal_evidence(r) for r in valid)
+    print(f"self_reported_temporal_order_n={evidence}  missing_or_invalid_temporal_evidence_n={len(valid) - evidence}")
+    print("可靠性分箱：全部有效模型预测；空箱显示 n=0，末箱包含 1。")
+    for index in range(10):
+        bucket = [r for r in valid if min(int(r["p"] * 10), 9) == index]
+        label = f"[{index / 10:.1f},{(index + 1) / 10:.1f}{']' if index == 9 else ')'}"
+        if bucket:
+            mean = sum(r["p"] for r in bucket) / len(bucket)
+            frequency = sum(r["outcome"] == "yes" for r in bucket) / len(bucket)
+            print(f"{label} n={len(bucket)} mean_p={mean:.4f} observed_yes={frequency:.4f} gap={frequency - mean:+.4f}")
+        else:
+            print(f"{label} n=0 mean_p=NA observed_yes=NA gap=NA")
+    print("时间字段是自报证据，旧记录缺失不得视为无泄漏验证；本工具不提供正式验证。")
+    print("正式验证还需可审计的时点数据、结算规则、样本外设计及独立性/选择偏差检查。")
+    print("不存在 30 条即足够的阈值；分箱和技能分数无置信保证，相关样本降低有效样本量；只衡量概率，不衡量盈亏。")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Log and score your own probability forecasts.")
     ap.add_argument("--ledger", default=DEFAULT)
@@ -53,6 +114,9 @@ def main() -> int:
     log.add_argument("--question", required=True)
     log.add_argument("--p", type=float, required=True, help="Your probability that YES resolves true.")
     log.add_argument("--price", type=float, default=None, help="Executable ask you recorded, if any.")
+    log.add_argument("--predicted-at", default=None, help="Forecast timestamp with timezone; defaults to logging time.")
+    log.add_argument("--available-cutoff-at", default=None,
+                     help="Self-reported latest information availability timestamp with timezone (not a future settlement cutoff).")
     log.add_argument("--resolve-date", default="")
     log.add_argument("--thesis", default="")
     log.add_argument("--invalidation", default="")
@@ -67,11 +131,23 @@ def main() -> int:
     args.ledger = _safe_ledger(args.ledger)
 
     if args.cmd == "log":
-        if not 0 <= args.p <= 1:
-            ap.error("--p must be within 0-1")
+        if not valid_probability(args.p):
+            ap.error("--p must be finite and within 0-1")
+        if args.price is not None and not valid_probability(args.price):
+            ap.error("--price must be finite and within 0-1")
+        now = datetime.now(timezone.utc)
+        try:
+            predicted = timestamp(args.predicted_at) if args.predicted_at else now
+            cutoff = timestamp(args.available_cutoff_at) if args.available_cutoff_at else None
+            if predicted > now or (cutoff is not None and cutoff > predicted):
+                raise ValueError("require available-cutoff-at <= predicted-at <= logging time")
+        except (ValueError, TypeError) as exc:
+            ap.error(str(exc))
         record = {
-            "id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6],
-            "logged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "id": now.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6],
+            "logged_at": now.isoformat(),
+            "predicted_at": predicted.isoformat(),
+            "available_cutoff_at": cutoff.isoformat() if cutoff else None,
             "question": args.question, "p": args.p, "price": args.price,
             "resolve_date": args.resolve_date, "thesis": args.thesis,
             "invalidation": args.invalidation, "size": args.size,
@@ -99,19 +175,7 @@ def main() -> int:
         print(f"resolved {args.id} -> {args.outcome}")
         return 0
 
-    rows = [r for r in load(args.ledger) if r.get("outcome") in ("yes", "no")]
-    if not rows:
-        print("no resolved records yet; Brier and calibration need outcomes, not intentions")
-        return 0
-    brier = sum((r["p"] - (1.0 if r["outcome"] == "yes" else 0.0)) ** 2 for r in rows) / len(rows)
-    market = [r for r in rows if r.get("price") is not None]
-    market_brier = (sum((r["price"] - (1.0 if r["outcome"] == "yes" else 0.0)) ** 2
-                        for r in market) / len(market)) if market else None
-    print(f"resolved={len(rows)}  Brier(yours)={brier:.4f}")
-    if market_brier is not None:
-        print(f"Brier(market price)={market_brier:.4f}  skill={1 - brier / market_brier:+.1%}"
-              if market_brier > 0 else "market Brier is zero")
-    print("样本少于 30 条时，把差异当作噪音；这里只衡量概率，不衡量盈亏。")
+    score(load(args.ledger))
     return 0
 
 

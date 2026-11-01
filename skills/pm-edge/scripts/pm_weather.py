@@ -24,10 +24,10 @@ Batch replies are mapped to stations by coordinate and fail closed on mismatch;
 cache files live under a versioned namespace so older contaminated data is never
 read back.
 
-`--settle YYYY-MM-DD` grades a finished date instead of scanning: actuals from
-IEM/HKO, the winning bracket, and the cached model centre's miss. Every graded
-row is written to .cache/settle_history.jsonl (re-running a date replaces its
-rows), so calibration evidence accumulates for free.
+`--settle YYYY-MM-DD` checks each station's completed local day: provisional
+IEM/HKO observations, bracket mapping, and an eligible prediction-snapshot centre.
+Source completeness is not verified here: rows remain pending and are excluded
+from validated bias evidence. Settlement never modifies forecast snapshots.
 
 `--bias` replays that history: per-city mean miss and scatter of the model
 centre vs the settled actual, plus the centre bracket's hit rate -- the numbers
@@ -54,6 +54,12 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
+
+# Windows consoles may still use GBK; do not let a warning abort a scan.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="backslashreplace")
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from statistics import mean, median, pstdev
@@ -466,6 +472,7 @@ def discover(target: date, closed: bool = False):
             kind = "low" if "lowest" in title.lower() else "high"
             events.append({"id": e.get("id"), "title": title, "code": code, "hk": hk,
                            "unit": unit, "kind": kind, "vol": float(e.get("volume24hr") or 0),
+                           "description": desc, "resolutionSource": e.get("resolutionSource"),
                            "markets": e.get("markets") or []})
     return events
 
@@ -838,7 +845,7 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
             return None
         except Exception as exc:
             print(f"prewarm {label} 首次失败（{type(exc).__name__}: {exc}），稍后重试", file=sys.stderr)
-            return (_do, label, sts, cache_ok)
+            return (fn_factory, label, sts, cache_ok)
 
     def have_prev(sts):
         return all(pathlib.Path(CACHE, f"prevparse_{st}_{obs_start}_{obs_end}.json").exists()
@@ -876,7 +883,9 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
     for fn, label, sts, cache_ok in failed:
         names = "、".join(city_name(s) for s in sts)
         if cache_ok(sts):
-            print(f"prewarm {label} 拉取失败（{names}）：沿用上次缓存，数据可能不是最新",
+            with LOCK:
+                _PREWARM_FAILED.update(sts)
+            print(f"prewarm {label} 拉取失败（{names}）：已有缓存未核实新鲜度，本次排除，不作为可信预测",
                   file=sys.stderr)
         else:
             with LOCK:
@@ -987,7 +996,7 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
             row = _row(ev, mk, p, p, p, None, None, centre=centre, sigma=sigma,
                        note=hko_note + "；网格残差非官方误差，仅情景观察", spread=0.0,
                        p_drift=drift, p_stress=drift, steps=st)
-            row["probability_basis"] = "校准正态情景，非已验证胜率"
+            row["probability_basis"] = "未验证正态情景，非已验证胜率"
             row["p_calibrated"] = round(p_calibrated, 4)
             row["research_only"] = True
             rows.append(row)
@@ -1073,6 +1082,9 @@ def _row(ev, mk, pmin, pmean, pmax, pr, pb, centre, sigma, note="", spread=None,
     return {
         "code": ev["code"], "city": city_name(ev["code"]), "kind": ev["kind"], "unit": ev["unit"],
         "title": ev["title"], "label": mk.get("groupItemTitle"),
+        "event_id": ev.get("id"), "market_id": mk.get("id"),
+        "rules": mk.get("description") or ev.get("description"),
+        "resolution_source": mk.get("resolutionSource") or ev.get("resolutionSource"),
         "p_min": pmin, "p_mean": pmean, "p_max": pmax, "p_drift": p_drift,
         "p_stress": p_drift if p_stress is None else p_stress,
         "bid": as_float(mk.get("bestBid")), "ask": as_float(mk.get("bestAsk")),
@@ -1144,7 +1156,7 @@ def _cell(text):
 
 
 def _p_basis(r):
-    return "校准正态概率" if r.get("p_calibrated") else ("模型成员比例（未校准情景）")
+    return "未验证正态情景" if r.get("p_calibrated") else ("模型成员比例（未校准情景）")
 
 
 def _fee_ok(r, spend, fee_rate, side="yes") -> bool:
@@ -1165,7 +1177,7 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
     def complete(r, side):
         return bool(r.get(f"{side}_complete"))
 
-    out = []
+    out = ["费用未核实的行仅为毛情景，不代表净边际或可执行建议。正态分布未经校准验证。"]
     # ---- equal-share YES+NO pair: only a fully filled ASK+ASK cost is shown, and
     # only as a gross observation unless a verified per-share fee was supplied.
     pairs = [r for r in rows if r.get("pair") and r["pair"].get("complete")]
@@ -1189,9 +1201,10 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
     if mode in ("yes", "both"):
         cand = [r for r in rows if r.get("yes_vwap") and complete(r, "yes")
                 and r.get("p_calibrated", r["p_min"]) - r["yes_vwap"] >= min_edge and ok(r)
+                and not r.get("research_only")
                 and _fee_ok(r, spend, None, "yes")]
         cand.sort(key=lambda r: -(r.get("p_calibrated", r["p_min"]) - r["yes_vwap"]))
-        out.append("## 候选 YES｜校准概率高于当前可成交价")
+        out.append("## YES 毛情景｜未验证情景高于当前可成交价")
         out.append("| 盘面 | 市场 | 档位 | 概率（依据） | 市场价 | 现价可成交 | 等待限价 | 便宜多少 | 撤单/失效 |")
         out.append("|---|---|---|---|---|---|---|---|---|")
         for r in cand[:max(1, top)]:
@@ -1227,7 +1240,7 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
                 continue
             cand.append(r)
         cand.sort(key=lambda r: -((1 - r.get("p_calibrated", r["p_max"])) - r["no_vwap"]))
-        out.append("## 候选 NO｜赌这一档不会中（含压力测试）")
+        out.append("## NO 毛情景｜赌这一档不会中（含压力测试）")
         out.append("| 盘面 | 市场 | 档位 | 概率（依据） | 市场价 | 现价可成交 | 等待限价 | 赔率 | 压力后胜率 | 状态 |")
         out.append("|---|---|---|---|---|---|---|---|---|---|")
         shown = [r for r in cand if not r.get("research_only")][:max(1, top)]
@@ -1247,7 +1260,7 @@ def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
             out.append(f"| {_cell(_market(r))} | {KIND_CN.get(r['kind'], r.get('kind', ''))} "
                        f"| {_cell(r['label'])}{_step_mark(r)} "
                        f"| {1 - p_cal:.0%}（{_cell(_p_basis(r))}） "
-                       f"| {1 - mkt_no:.0%} "
+                       f"| {mkt_no:.0%} "
                        f"| {no_v:.3f} | {'—' if limit is None else f'{limit:.3f}'} "
                        f"| {(1 - no_v) / no_v:.2f}:1 | {stress:.0%} | {status} |")
         out.append("\n压力测试对每个 NO 都施加 ±0.5/1/1.5°C 全体成员平移（华氏 ×1.8），"
@@ -1312,21 +1325,39 @@ def _winner_label(ev, v: float, hk: bool):
 
 
 def _cached_centre(code, kind, target, obs_start, obs_end, unit):
-    """Model centre from the scan-time stats cache, any age (grading only)."""
-    tag = hashlib.sha256(f"{code}|{kind}|{target}|{obs_start}|{obs_end}".encode()).hexdigest()[:24]
-    p = pathlib.Path(CACHE, "stats_" + tag + ".json")
-    if not p.exists():
+    """Only an immutable, pre-local-day prediction snapshot is eligible."""
+    matches = []
+    if not FORECAST_HISTORY.exists():
         return None
-    try:
-        stats = json.loads(p.read_text(encoding="utf-8"))
-        cs = [sorted(v["members"])[len(v["members"]) // 2] + v["bias"]
-              for v in stats["per_model"].values() if v.get("members")]
-        if not cs:
-            return None
-        c = median(cs)
-        return c * (9 / 5 if unit == "F" else 1.0) + (32.0 if unit == "F" else 0.0)
-    except Exception:
-        return None
+    zone = "Asia/Hong_Kong" if code == "HKO" else STATIONS[code]["tz"]
+    for line in FORECAST_HISTORY.read_text(encoding="utf-8").splitlines():
+        try:
+            snap = json.loads(line)
+            stamp = datetime.fromisoformat(snap["captured_at_utc"])
+            if snap["target"] != target.isoformat() or stamp.astimezone(ZoneInfo(zone)).date() >= target:
+                continue
+            for row in snap["rows"]:
+                if (row["code"], row["kind"], row["unit"]) == (code, kind, unit):
+                    matches.append((stamp, row["centre"]))
+                    break
+        except (ValueError, KeyError, TypeError):
+            continue
+    return min(matches, key=lambda x: x[0])[1] if matches else None
+
+
+FORECAST_HISTORY = pathlib.Path(CACHE, "forecast_snapshots.jsonl")
+
+
+def snapshot_forecast(target, rows, captured_at=None):
+    """Append observations of predictions; settlement never writes this ledger."""
+    rec = {"snapshot_id": str(uuid.uuid4()), "target": target.isoformat(),
+           "captured_at_utc": captured_at or datetime.now(ZoneInfo("UTC")).isoformat(),
+           "model_issued_at": None, "model_issued_at_status": "源起报时间缺失，抓取时间不等于起报时间",
+           "probability_status": "未验证情景，非校准胜率", "rows": rows}
+    with LOCK:
+        with FORECAST_HISTORY.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    return rec["snapshot_id"]
 
 
 SETTLE_HISTORY = pathlib.Path(CACHE, "settle_history.jsonl")
@@ -1339,7 +1370,7 @@ def _append_history(records):
     duplicates, so --bias stays clean."""
     if not records:
         return
-    key = lambda r: (r["d"], r["code"], r["kind"])
+    key = lambda r: (r["d"], r["code"], r["kind"], r.get("unit", "C"))
     fresh = {key(r): r for r in records}
     old = []
     if SETTLE_HISTORY.exists():
@@ -1380,7 +1411,7 @@ def _centre_hit_winner(r):
 def bias_report() -> int:
     """Replay settle history: how far the model centre lands from the actual."""
     if not SETTLE_HISTORY.exists():
-        print("还没有结算历史：先跑 --settle YYYY-MM-DD（每天扫完记得结算，历史才攒得起来）。")
+        print("还没有结算历史：--settle YYYY-MM-DD 仅记录待核验（pending）观测，不自动产生已验证回测证据。")
         return 1
     recs = []
     for line in SETTLE_HISTORY.read_text(encoding="utf-8").splitlines():
@@ -1390,10 +1421,13 @@ def bias_report() -> int:
                 recs.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    graded = [r for r in recs if isinstance(r.get("centre"), (int, float))]
+    graded = [r for r in recs if r.get("centre_source") == "prediction_snapshot"
+              and r.get("evidence_status") == "verified"
+              and isinstance(r.get("centre"), (int, float))]
     print(f"# 模型中心 vs 实际｜累计回测（{len(recs)} 条结算，其中 {len(graded)} 条有扫描时中心）\n")
     if not graded:
-        print("还没有可回测的行：中心来自扫描缓存，--settle 之前当天要先扫过该日期。")
+        print("还没有符合条件的回测行：需目标当地日开始前完成采集的预测快照，且结算源完整性已核验（verified）。")
+        print("--settle 当前仅写入待核验（pending）记录，不会自动成为已验证回测证据；旧扫描缓存不能替代预测快照。")
         return 0
 
     def stat(rs):
@@ -1415,26 +1449,37 @@ def bias_report() -> int:
         hit = f"{s['hit']:.0%}" if s["hit"] is not None else "-"
         print(f"| {city} | {KIND_CN.get(kind, kind)} | {s['n']} | {s['bias']:+.1f}°{unit} "
               f"| {s['sigma']:.1f} | {hit} | {s['close']:.0%} |")
-    s = stat(graded)
-    print(f"| **合计** | - | {s['n']} | {s['bias']:+.2f} | {s['sigma']:.2f} | {s['hit']:.0%} | {s['close']:.0%} |")
+    for unit in sorted({r.get("unit", "C") for r in graded}):
+        s = stat([r for r in graded if r.get("unit", "C") == unit])
+        hit = "-" if s["hit"] is None else f"{s['hit']:.0%}"
+        print(f"| **合计 °{unit}** | - | {s['n']} | {s['bias']:+.2f} | {s['sigma']:.2f} | {hit} | {s['close']:.0%} |")
     print("\n读法：平均偏差是系统性偏移（正=模型偏冷）；σ 决定 NO 要离中心几档才稳；"
           "中心档命中率 ≈ 贴脸 NO 的实际翻车率。样本按城市×市场积累，n<10 只当参考。")
     return 0
 
 
-def settle(target: date) -> int:
-    """Grade a finished date: actuals, winning bracket, and the model centre's miss."""
-    utc_today = datetime.now(ZoneInfo("UTC")).date()
-    if target >= utc_today:
-        print(f"{target} 尚未结束（UTC 今天 {utc_today}）：当地日仍在走，"
-              f"现在的极值不是最终结算值，本次不写入历史。", file=sys.stderr)
-        return 2
+def filter_events(events, only=""):
+    want = {x.strip().lower() for x in only.split(",") if x.strip()}
+    return [e for e in events if not want or e["code"].lower() in want
+            or city_name(e["code"]).lower() in want
+            or any(w in e["title"].lower() for w in want)]
+
+
+def local_day_finished(target, code, now=None):
+    zone = "Asia/Hong_Kong" if code == "HKO" else STATIONS[code]["tz"]
+    now = now or datetime.now(ZoneInfo("UTC"))
+    return now.astimezone(ZoneInfo(zone)).date() > target
+
+
+def settle(target: date, only="") -> int:
+    """Source observations are provisional until designated-source coverage is verified."""
+    failures = 0
     merged, ids = [], set()
     for ev in discover(target) + discover(target, closed=True):
         if ev["id"] not in ids:
             ids.add(ev["id"])
             merged.append(ev)
-    events = merged
+    events = filter_events(merged, only)
     print(f"# {target} 结算核对（{len(events)} 个事件）\n")
     print("| 城市 | 市场 | 实际 | 获胜档 | 模型中心（缓存） | 偏差 | 备注 |")
     print("|---|---|---|---|---|---|---|")
@@ -1443,37 +1488,50 @@ def settle(target: date) -> int:
     records = []
     for ev in sorted(events, key=lambda e: -e.get("vol") or 0):
         code, kind = ev["code"], ev["kind"]
-        if code == "HKO":
-            kind_key = "CLMMAXT" if kind == "high" else "CLMMINT"
-            col = "max" if kind == "high" else "min"
-            v = (hko_extract_month(target.year, target.month, col).get(target)
-                 or hko_month(kind_key, target.year, target.month).get(target))
-            if v is None:
-                print(f"| 香港 | {KIND_CN[kind]} | 天文台摘录未发布（滞后1-2天） | - | - | - | 非最终，不进入历史 |")
-                continue
-            winner, unit = _winner_label(ev, v, hk=True), "°C"
-        else:
-            hi, lo = settle_daily(code, STATIONS[code]["tz"], target)
-            v = hi if kind == "high" else lo
-            if v is None:
-                print(f"| {city_name(code)} | {KIND_CN[kind]} | 无观测数据 | - | - | - | 非最终，不进入历史 |")
-                continue
-            if ev["unit"] == "F":          # METAR obs are Celsius; the ladder is Fahrenheit
-                v = v * 9 / 5 + 32
-            winner, unit = _winner_label(ev, v, hk=False), ("°F" if ev["unit"] == "F" else "°C")
+        if not local_day_finished(target, code):
+            failures += 1
+            print(f"{code}: 当地日尚未结束，不写历史", file=sys.stderr)
+            continue
+        try:
+            if code == "HKO":
+                kind_key = "CLMMAXT" if kind == "high" else "CLMMINT"
+                col = "max" if kind == "high" else "min"
+                v = hko_extract_month(target.year, target.month, col).get(target)
+                if v is None:
+                    v = hko_month(kind_key, target.year, target.month).get(target)
+                if v is None:
+                    print(f"| 香港 | {KIND_CN[kind]} | 天文台摘录未发布（滞后1-2天） | - | - | - | 非最终，不进入历史 |")
+                    failures += 1
+                    continue
+                winner, unit = _winner_label(ev, v, hk=True), "°C"
+            else:
+                hi, lo = settle_daily(code, STATIONS[code]["tz"], target)
+                v = hi if kind == "high" else lo
+                if v is None:
+                    print(f"| {city_name(code)} | {KIND_CN[kind]} | 无观测数据 | - | - | - | 非最终，不进入历史 |")
+                    failures += 1
+                    continue
+                if ev["unit"] == "F":          # METAR obs are Celsius; the ladder is Fahrenheit
+                    v = v * 9 / 5 + 32
+                winner, unit = _winner_label(ev, v, hk=False), ("°F" if ev["unit"] == "F" else "°C")
+        except Exception as exc:
+            failures += 1
+            print(f"{code}: 来源失败，待定 ({type(exc).__name__}: {exc})", file=sys.stderr)
+            continue
         centre = _cached_centre(code, kind, target, obs_start, obs_end, ev["unit"])
         miss = f"{v - centre:+.1f}" if centre is not None else "-"
         c_txt = f"{centre:.1f}" if centre is not None else "-"
-        note = "有扫描时中心" if centre is not None else "无扫描时中心，仅实际值"
+        note = "待定：未完成指定结算源完整性核验；" + ("有预测快照中心" if centre is not None else "无可信预测快照中心")
         print(f"| {city_name(code)} | {KIND_CN[kind]} | {v:.1f}{unit} | {winner} | {c_txt} | {miss} | {note} |")
         records.append({"d": target.isoformat(), "code": code, "city": city_name(code),
                         "kind": kind, "unit": ev["unit"], "actual": v, "winner": winner,
                         "centre": centre,
-                        "centre_source": "scan_cache" if centre is not None else None})
+                        "evidence_status": "pending_source_verification",
+                        "centre_source": "prediction_snapshot" if centre is not None else None})
     _append_history(records)
     if records:
         print(f"\n已并入结算历史 {len(records)} 行 → {SETTLE_HISTORY.name}（--bias 看累计偏差回测）")
-    return 0
+    return 2 if failures or not records else 0
 
 
 def main() -> int:
@@ -1510,7 +1568,7 @@ def main() -> int:
     target = (date.fromisoformat(args.date) if args.date
               else datetime.now(ZoneInfo("UTC")).date() + timedelta(days=1))
     if args.settle:
-        return settle(date.fromisoformat(args.settle))
+        return settle(date.fromisoformat(args.settle), args.only)
     if args.bias:
         return bias_report()
     today_local = datetime.now(ZoneInfo("UTC")).date()
@@ -1521,21 +1579,19 @@ def main() -> int:
     obs_start = obs_end - timedelta(days=args.lookback)
 
     events = discover(target)
-    if args.only:
-        want = {x.strip().lower() for x in args.only.split(",") if x.strip()}
-        events = [e for e in events
-                  if e["code"].lower() in want or city_name(e["code"]).lower() in want
-                  or any(w in e["title"].lower() for w in want)]
+    events = filter_events(events, args.only)
     if not events:
         print(f"no open temperature markets for {target}")
         return 1
     print(f"{target} | {len(events)} events", file=sys.stderr)
 
     t0 = time.time()
+    _PREWARM_FAILED.clear()
     prewarm([ev["code"] for ev in events], target, obs_start, obs_end, workers=args.workers)
     print(f"prewarm {time.time() - t0:.1f}s", file=sys.stderr)
 
     rows = []
+    failures = len(_PREWARM_FAILED)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(price_event, ev, target, obs_start, obs_end, args.spend): ev
                    for ev in events if ev["code"] != "HKO"}
@@ -1545,11 +1601,13 @@ def main() -> int:
             try:
                 rows.extend(f.result())
             except Exception as exc:
+                failures += 1
                 print(f"skip {ev['title']}: {type(exc).__name__} {exc}", file=sys.stderr)
         for ev in hk:
             try:
                 rows.extend(price_event(ev, target, obs_start, obs_end, args.spend))
             except Exception as exc:
+                failures += 1
                 print(f"skip {ev['title']}: {type(exc).__name__} {exc}", file=sys.stderr)
 
     # only bother reading books for plausible candidates
@@ -1558,16 +1616,21 @@ def main() -> int:
     attach_books(shortlist, args.spend, fee_per_share=args.fee_per_share,
                  discount_ticks=args.discount_ticks, tick_size=args.tick_size)
 
+    # Stamp only after all forecast and book collection has completed. A scan
+    # crossing local midnight must not masquerade as a pre-local-day forecast.
+    snapshot_forecast(target, rows)
+    exit_code = 2 if failures or not rows else 0
+
     if args.json:
         print(json.dumps(shortlist, ensure_ascii=False, indent=1, default=str))
-        return 0
+        return exit_code
 
     print(f"\n# {target} 天气盘扫描  (每边 {args.spend:.0f} 份, 边际门槛 {args.min_edge*100:.0f}pp)\n")
     table = fmt_table(shortlist, args.spend, args.min_edge, args.mode, args.top,
                       args.max_spread, risky=args.risky,
                       discount_ticks=args.discount_ticks, tick_size=args.tick_size)
     print(table if table.strip() else "没有过门槛的档位。")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
