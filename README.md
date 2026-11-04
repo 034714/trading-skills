@@ -1,16 +1,17 @@
 # Trading Skills
 
-面向 AI 助手的三个只读交易研究技能。输出条件化计划，不自动交易，也不保证收益。
+面向 AI 助手的四个只读交易研究技能。输出条件化计划，不自动交易，也不保证收益。
 
-- **pm-edge**：预测市场研究，优先天气与文化；明确事件日期，比较 YES / NO，先审计结算规则，再核对报价与费用。
+- **pm-edge**：预测市场研究：天气、推文计数、奖项票房等日更或慢变量；明确事件日期，比较 YES / NO，先审计结算规则，再核对报价与费用。
+- **pm-liquid**：流动性优先的事件合约研究；同时读 Polymarket / Kalshi 两侧真实盘口，按价差与 20 份可成交深度筛选，默认挂被动限价，内置低价/高价屏幕与跨平台同事件比价。
 - **trade**：BTC / ETH（可扩展到其他币）技术与期权研究；一条命令带现价、资金费率、OI、多空比快照、1H/4H 日内背景与山寨币筛选；回复第一句就给「现在做什么」的大白话结论；区分行情快照、模型假设和可执行条件，不把指标或历史波动率比较直接当作买卖信号。
 - **stock**：Gate 股票类 USDT 永续（美股/港股/指数/未上市 AI 公司）条件研究；无默认标的，`--list` 查合约；一条命令带执行层快照（标记价 vs 指数锚溢价、按合约周期资金费、OI、多空账户数）、Yahoo 底层指标、1H 日内背景与美股时段状态；单一场所与财报未核查照直说。
 
 ## 安装
 
-从 [Releases](https://github.com/034714/trading-skills/releases) 的 **Assets** 下载所需的 `pm-edge.zip`、`trade.zip` 或 `stock.zip`，解压后将对应 skill 目录导入客户端（若支持目录导入），或复制到下述技能目录。每个 skill 根目录应直接包含 `SKILL.md`，避免多套一层目录。GitHub 自动生成的 **Source code (zip/tar.gz)** 是整个仓库源码，不是单个 skill 安装包；若下载源码，请使用其中 `skills/` 下对应目录。
+从 [Releases](https://github.com/034714/trading-skills/releases) 的 **Assets** 下载所需的 `pm-edge.zip`、`pm-liquid.zip`、`trade.zip` 或 `stock.zip`，解压后将对应 skill 目录导入客户端（若支持目录导入），或复制到下述技能目录。每个 skill 根目录应直接包含 `SKILL.md`，避免多套一层目录。GitHub 自动生成的 **Source code (zip/tar.gz)** 是整个仓库源码，不是单个 skill 安装包；若下载源码，请使用其中 `skills/` 下对应目录。
 
-将 `skills/pm-edge`、`skills/trade` 和 `skills/stock` 复制到助手支持的 skill 目录，例如支持该路径的客户端使用 `~/.agents/skills/`；MiMo Desktop 可使用 `~/.config/mimocode/skills/`。具体路径以客户端文档为准，安装后确认已发现技能，不要同时安装同名的多份副本。
+将 `skills/pm-edge`、`skills/pm-liquid`、`skills/trade` 和 `skills/stock` 复制到助手支持的 skill 目录，例如支持该路径的客户端使用 `~/.agents/skills/`；MiMo Desktop 可使用 `~/.config/mimocode/skills/`。具体路径以客户端文档为准，安装后确认已发现技能，不要同时安装同名的多份副本。
 
 直接运行脚本需要 Python 3.10+；脚本使用标准库，离线测试需安装 `pytest`。从仓库根目录运行下方命令；参数以脚本 `--help` 为准。取数需要访问各公开接口，不需要交易账户密钥。
 
@@ -19,11 +20,26 @@
 - `/pm-edge 扫描明天的天气盘，看看有没有值得做的。`
 - `/pm-edge 只看纽约、东京、香港。`
 - `/pm-edge 这周有什么热门盘值得看？不看天气。`
+- `/pm-liquid 扫一下今晚和这周的深盘，优先能挂单的。`
+- `/pm-liquid 湖人这场两边盘口怎么样？能不能挂限价？`
 - `/trade BTC、ETH 现在什么结构？我想 79500 接多、止损 77800，给分批计划和期权适配。`
 - `/trade 今天有没有日内级别的机会？`
 - `/trade 顺带扫一下山寨币有什么值得细看的。`
 - `/stock 长鑫、宇树、智谱我现在该怎么办？我有多单。`
 - `/stock Gate 上有哪些股票合约可以交易？`
+
+## pm-liquid：流动性优先的事件合约
+
+`pm-liquid` 只做“当下真的能成交”的盘：默认扫体育、宏观数据、政治、金融，读两侧真实 ask/bid、20 份完整成交、费用与收盘时间；24h 成交只作参考（Kalshi 按 $1 名义、串关膨胀；临开赛/刚结束都会失真）。默认不主动买 <10¢、不追 >90¢，入场默认挂被动限价。
+
+```bash
+python skills/pm-liquid/scripts/scan.py --top 8                 # both，首次约 40s，缓存命中约 20s
+python skills/pm-liquid/scripts/scan.py --query "Lakers"        # 指定事件同轮读两边
+python skills/pm-liquid/scripts/scan.py --tail                  # 高赔率模式，放开 10–90c
+python skills/pm-liquid/scripts/scan.py --platform kalshi --series KXCPI,KXPAYROLLS,KXFED
+```
+
+输出每行：平台、对象·周期（UTC 收盘）、两侧 ask/bid、20 份 VWAP、费用、24h 量、状态（Y/N 可挂、深度不足、价差超限、价格屏）。Longshot、maker/taker、成交量口径与跨平台比价见 `skills/pm-liquid/references/playbook.md`。
 
 ## 预测市场：通用发现 + 天气专用模型
 
@@ -36,7 +52,7 @@ python skills/pm-edge/scripts/pm_scan.py --query "tweet,posts" --top 8
 
 输出每行的本侧买价/卖价、价差、成交量、费用状态，以及两个**挂单流动性占比**（买盘 NO 占比 / 卖盘 NO 占比）。这两个数字是"最优价 2¢ 内的美元挂单占比"，用来判断流动性厚薄和挂单拥挤，**不是人数、信心或胜率**。
 
-天气盘额外有概率模型（三模式集合成员 + 滚动偏差修正），但仍标"未校准情景"：
+天气盘额外有概率模型（三模式集合成员 + 滚动偏差修正），但只是模型情景，不是实测概率：
 
 ```bash
 python skills/pm-edge/scripts/pm_weather.py --date YYYY-MM-DD --top 10  # 替换为目标当地日期；费用另核实
@@ -48,7 +64,7 @@ python skills/pm-edge/scripts/pm_weather.py --bias                      # 累计
 
 > | 盘面 | 市场 | 档位 | 概率（依据） | 现价可成交 | 等待限价 | 赔率 | 压力后胜率 | 状态 |
 
-- **概率（依据）** 明确写出来源：模型成员比例（未校准）、独立基准率、或"无独立估计"。
+- **概率（依据）** 明确写出来源：集合情景比例、独立基准率、或"无独立估计"。
 - **现价可成交** 是本侧真实 ask 走单均价，且已验证能覆盖计划份数；深度不够会标"深度不足"，不给价格。
 - **等待限价** 是低于现价若干 tick 的被动买单情景，不是报价，也不保证成交。
 - **压力后胜率**（天气 NO）对每个档都施加 ±1.5°C 的全体成员平移；中心落在卖档内的只能观察。
@@ -100,7 +116,7 @@ python -B skills/stock/scripts/stock_ctx.py --list --sort volume --top 12 --unde
 
 `--list` 已移除前120行硬截断，默认完整输出；可加 `--min-volume`。日线/4H/1H附源K线时间与过期标记，假期/提前收盘仍须查官方日历。新闻、宏观局势与财报采用明确人工联网工作流：官方优先，记录发布/事件/查询时间，事实与解读及情景分开，未查不说无事件。卡片将历史摆点结构目标与算术R目标分列，附触发待确认、持有周期与到期；不保证到价。
 
-stock专项离线回归现为28项（含3个真实提示的规则评估，不是fresh会话模型评测）。
+stock专项离线回归现为28项（含3个真实提示的规则评估，不是fresh会话模型评测）；pm-liquid 离线回归 9 项。
 
 ## 重要边界
 
@@ -114,11 +130,11 @@ stock专项离线回归现为28项（含3个真实提示的规则评估，不是
 
 ## English overview
 
-Three read-only research skills for AI assistants: **pm-edge** for prediction markets (Polymarket / Kalshi discovery and weather-specific models), **trade** for crypto market structure and options candidates, and **stock** for Gate stock-linked USDT perpetuals. No automated orders, account keys or profit guarantees.
+Four read-only research skills for AI assistants: **pm-edge** for weather, count and cultural prediction markets, **pm-liquid** for liquidity-first event contracts on Polymarket / Kalshi, **trade** for crypto market structure and options candidates, and **stock** for Gate stock-linked USDT perpetuals. No automated orders, account keys or profit guarantees.
 
 Copy the desired `skills/<name>` directory into your client's supported skills directory; avoid duplicate names. CLI scripts require Python 3.10+ and use the standard library. Run commands above from the repository root and check each script's `--help`. Dates are local to the contract, not necessarily your computer.
 
-Quotes are snapshots, not live instructions. Verify timestamps, executable depth, fees and settlement rules. Stock news, macro events, earnings, holidays and early closes require manual verification; “not checked” never means “no event”. Weather ensemble proportions are uncalibrated scenarios. Equal-size YES+NO pairing uses both executable asks plus all costs, not a bid/ask mix, and is not risk-free. IV versus historical RV is descriptive, not a mispricing or selling signal.
+Quotes are snapshots, not live instructions. Verify timestamps, executable depth, fees and settlement rules. Stock news, macro events, earnings, holidays and early closes require manual verification; “not checked” never means “no event”. Weather ensemble proportions are model scenarios, not measured probabilities. Equal-size YES+NO pairing uses both executable asks plus all costs, not a bid/ask mix, and is not risk-free. IV versus historical RV is descriptive, not a mispricing or selling signal.
 
 ## 验证范围
 

@@ -973,7 +973,7 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
             return rows
         e = est[ev["kind"]]
         centre, sigma = e["official"], e["sigma"]
-        hko_note = f"天文台官方预报{centre:.0f}°C；网格残差σ≈{sigma:.1f}，官方误差未校准"
+        hko_note = f"天文台官方预报{centre:.0f}°C；网格残差σ≈{sigma:.1f}，官方误差尚无样本外估计"
         for mk in ev["markets"]:
             bd = hk_interval(mk.get("groupItemTitle"))
             if not bd:
@@ -996,7 +996,7 @@ def price_event(ev, target: date, obs_start: date, obs_end: date, spend: float):
             row = _row(ev, mk, p, p, p, None, None, centre=centre, sigma=sigma,
                        note=hko_note + "；网格残差非官方误差，仅情景观察", spread=0.0,
                        p_drift=drift, p_stress=drift, steps=st)
-            row["probability_basis"] = "未验证正态情景，非已验证胜率"
+            row["probability_basis"] = "集合分布情景"
             row["p_calibrated"] = round(p_calibrated, 4)
             row["research_only"] = True
             rows.append(row)
@@ -1156,7 +1156,7 @@ def _cell(text):
 
 
 def _p_basis(r):
-    return "未验证正态情景" if r.get("p_calibrated") else ("模型成员比例（未校准情景）")
+    return "集合分布情景" if r.get("p_calibrated") else "集合成员比例"
 
 
 def _fee_ok(r, spend, fee_rate, side="yes") -> bool:
