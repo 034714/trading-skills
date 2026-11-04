@@ -76,6 +76,13 @@ def test_verdict():
     assert scan.verdict(row, 0.05) == "Y低价屏+N高价屏"
 
 
+def test_pm_label():
+    assert scan.pm_label("Zverev vs Musetti", "Zverev vs Musetti",
+                         ["Zverev", "Musetti"]) == "Zverev vs Musetti｜YES=Zverev"
+    assert scan.pm_label("AEK vs Real Madrid", "Will Real Madrid win?", ["Yes", "No"])         == "AEK vs Real Madrid｜Will Real Madrid win?"
+    assert scan.pm_label("Aliens", "Aliens", ["Yes", "No"]) == "Aliens"
+
+
 def test_when_utc():
     from datetime import datetime, timedelta, timezone
     iso = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()

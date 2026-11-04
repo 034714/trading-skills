@@ -106,6 +106,18 @@ def same_event(a: str, b: str):
     return len(shared) >= 3 and len(shared) / len(ta | tb) >= 0.6
 
 
+def pm_label(event_title, question, outcomes):
+    """Disambiguate multi-outcome events: show which side YES actually is."""
+    outcomes = outcomes or []
+    yes_name = outcomes[0] if outcomes else None
+    title = event_title or question or ""
+    if yes_name and str(yes_name).lower() not in ("yes", "no", "true", "false"):
+        return f"{title}｜YES={yes_name}"
+    if question and question != title:
+        return f"{title}｜{question}"
+    return title
+
+
 def _safe(fn, label):
     try:
         return fn()
@@ -194,8 +206,9 @@ def polymarket_rows(tags, per_tag, keep, max_spread, tail):
         if ask is None:
             continue
         rate, fee_txt = pm_fee(mk)
+        label = pm_label(ev.get("title"), mk.get("question"), parse_list(mk.get("outcomes")))
         out.append({
-            "platform": "PM", "title": (ev.get("title") or "")[:70],
+            "platform": "PM", "title": label[:70],
             "question": (mk.get("question") or "")[:90],
             "yes_bid": bid, "yes_ask": ask,
             "no_bid": None, "no_ask": None,
