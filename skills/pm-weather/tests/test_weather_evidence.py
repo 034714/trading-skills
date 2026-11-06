@@ -24,6 +24,7 @@ def test_local_day_boundary():
 
 
 def test_snapshot_append_and_no_cache_reconstruction(tmp_path, monkeypatch):
+    monkeypatch.setattr(w, "SAVE_RECORDS", True)
     monkeypatch.setattr(w, "FORECAST_HISTORY", tmp_path / "predictions.jsonl")
     monkeypatch.setattr(w, "CACHE", str(tmp_path))
     day = date(2026, 1, 2)
@@ -40,6 +41,7 @@ def test_snapshot_append_and_no_cache_reconstruction(tmp_path, monkeypatch):
 
 
 def test_settle_filter_failure_isolation(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(w, "SAVE_RECORDS", True)
     monkeypatch.setattr(w, "discover", lambda *a, **k: [event(), event("RJTT", 2)])
     monkeypatch.setattr(w, "local_day_finished", lambda *a: True)
     calls = []
@@ -128,6 +130,7 @@ def test_main_output_modes_share_exit_status(monkeypatch, tmp_path, capsys):
         for mode in ("json", "table"):
             mock_scan(monkeypatch, tmp_path, mode, outcome)
             assert w.main() == expected, (mode, outcome)
+            assert not w.FORECAST_HISTORY.exists()
             output = capsys.readouterr().out
             if mode == "json":
                 assert isinstance(json.loads(output), list)
@@ -135,6 +138,7 @@ def test_main_output_modes_share_exit_status(monkeypatch, tmp_path, capsys):
 
 def test_main_snapshot_uses_collection_completion_time(monkeypatch, tmp_path):
     mock_scan(monkeypatch, tmp_path, "json", "ok")
+    monkeypatch.setattr(sys, "argv", sys.argv + ["--save-records"])
     class Clock(datetime):
         current = datetime(2026, 1, 2, 4, 59, tzinfo=timezone.utc)
         @classmethod
@@ -165,3 +169,16 @@ def test_bias_no_verified_samples_explains_requirements(monkeypatch, tmp_path, c
     assert "verified" in output and "pending" in output
     assert "不会自动成为已验证回测证据" in output
     assert "当天要先扫过" not in output
+
+
+def test_default_settle_does_not_save(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(w, "SAVE_RECORDS", False)
+    monkeypatch.setattr(w, "discover", lambda *a, **k: [event()])
+    monkeypatch.setattr(w, "local_day_finished", lambda *a: True)
+    monkeypatch.setattr(w, "settle_daily", lambda *a: (20, 10))
+    monkeypatch.setattr(w, "SETTLE_HISTORY", tmp_path / "data/settle.jsonl")
+    monkeypatch.setattr(w, "FORECAST_HISTORY", tmp_path / "data/pred.jsonl")
+    assert w.settle(date(2026, 1, 1)) == 0
+    output = capsys.readouterr().out
+    assert "未保存结算历史" in output and "已并入结算历史" not in output
+    assert list(tmp_path.iterdir()) == []

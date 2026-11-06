@@ -16,9 +16,9 @@ import json
 import sys
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from pathlib import Path
+from threading import Lock
 
 from pm_common import (FetchError, KALSHI, as_float, events_by_tag, full_fill,
                        http_json, markdown_cell, parse_list, yes_book)
@@ -28,8 +28,6 @@ KA_SERIES = "KXNBAGAME,KXNFLGAME,KXNHLGAME,KXCPI,KXPAYROLLS,KXFED,KXBTCD"
 WORKERS = 10
 SHARES = 20
 NO_BOOKS = 4
-BOOK_TTL = 90.0
-CACHE = Path(__file__).resolve().parent / ".cache"
 
 
 # ---------------------------------------------------------------- helpers
@@ -119,11 +117,11 @@ def pm_label(event_title, question, outcomes):
 
 
 def _safe(fn, label):
+    """Return (value, error), preserving empty successful responses."""
     try:
-        return fn()
+        return fn(), None
     except FetchError as exc:
-        print(f"warn: {label}: {exc}", file=sys.stderr)
-        return []
+        return None, f"{label}: {exc}"
 
 
 # ---------------------------------------------------------------- polymarket
@@ -138,48 +136,67 @@ def pm_fee(market):
     return rate, f"{rate:.0%}taker"
 
 
-def _cached_book(token: str):
-    """90s disk cache: CLOB rate-limits bursts, and a rescan should not refetch."""
-    CACHE.mkdir(exist_ok=True)
-    path = CACHE / f"book_{token[:20]}.json"
-    try:
-        if path.exists() and time.time() - path.stat().st_mtime < BOOK_TTL:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            return ([tuple(x) for x in raw["bids"]], [tuple(x) for x in raw["asks"]])
-    except (OSError, ValueError, KeyError):
-        pass
-    try:
-        bids, asks = yes_book(token)
-    except FetchError:
-        return [], []
-    try:
-        path.write_text(json.dumps({"bids": bids, "asks": asks}), encoding="utf-8")
-    except OSError:
-        pass
-    return bids, asks
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _pm_yes_book(market):
+class SourceErrors(list):
+    """Track successful discovery independently of surviving candidates."""
+    def __init__(self):
+        super().__init__()
+        self.discovery_ok = 0
+
+
+class RoundBooks:
+    """Full-token single-flight cache, owned by one scan; never reads/writes disk."""
+    def __init__(self):
+        self._lock = Lock()
+        self._books = {}
+
+    def get(self, token):
+        with self._lock:
+            owner = token not in self._books
+            future = self._books.setdefault(token, Future())
+        if owner:
+            try:
+                bids, asks = yes_book(token)
+                future.set_result((bids, asks, utc_now()))
+            except Exception as exc:
+                future.set_exception(exc)
+        return future.result()
+
+
+def _pm_book(market, side, cache):
     tokens = parse_list(market.get("clobTokenIds"))
-    return _cached_book(tokens[0]) if tokens else ([], [])
+    return cache.get(tokens[side]) if len(tokens) > side else ([], [], None)
 
 
-def _pm_no_book(market):
-    tokens = parse_list(market.get("clobTokenIds"))
-    return _cached_book(tokens[1]) if len(tokens) > 1 else ([], [])
+def matches_query(title, question, query):
+    return not query or query.lower() in ((title or "") + (question or "")).lower()
 
 
 def _empty_fill():
     return {"complete": False, "shares": 0.0, "vwap": None, "cost": 0.0}
 
 
-def polymarket_rows(tags, per_tag, keep, max_spread, tail):
+def polymarket_rows(tags, per_tag, keep, max_spread, tail, query=""):
     events = []
+    errors = SourceErrors()
+    cache = RoundBooks()
+    def fetch_events(tag):
+        batch = events_by_tag(tag, per_tag)
+        sampled_at = utc_now()
+        return [dict(ev, _sampled_at=sampled_at) for ev in batch]
+
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         fetched = list(pool.map(
-            lambda t: _safe(lambda: events_by_tag(t, per_tag), f"tag {t}"), tags))
-    for batch in fetched:
-        events.extend(batch)
+            lambda t: _safe(lambda: fetch_events(t), f"tag {t}"), tags))
+    for batch, error in fetched:
+        if error:
+            errors.append(error)
+        else:
+            errors.discovery_ok += 1
+        events.extend(batch or [])
     seen, markets = set(), []
     for ev in events:
         for mk in ev.get("markets") or []:
@@ -194,13 +211,20 @@ def polymarket_rows(tags, per_tag, keep, max_spread, tail):
             close = mk.get("endDate") or ev.get("endDate")
             if is_closed(close):
                 continue
+            label = pm_label(ev.get("title"), mk.get("question"), parse_list(mk.get("outcomes")))
+            if not matches_query(label[:70], (mk.get("question") or "")[:90], query):
+                continue
             markets.append((ev, mk, as_float(mk.get("volume24hr")) or 0.0, bid, ask))
     markets.sort(key=lambda m: -m[2])
     markets = markets[:keep]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        books = list(pool.map(lambda m: _pm_yes_book(m[1]), markets))
+        books = list(pool.map(lambda m: _safe(
+            lambda: _pm_book(m[1], 0, cache), f"YES book {m[1].get('id')}"), markets))
     out = []
-    for (ev, mk, vol, gbid, gask), (yb, ya) in zip(markets, books):
+    for (ev, mk, vol, gbid, gask), (book, error) in zip(markets, books):
+        if error:
+            errors.append(error)
+        yb, ya, sampled_at = book or ([], [], None)
         ask = ya[0][0] if ya else gask
         bid = (yb[0][0] if yb else gbid)
         if ask is None:
@@ -209,6 +233,8 @@ def polymarket_rows(tags, per_tag, keep, max_spread, tail):
         label = pm_label(ev.get("title"), mk.get("question"), parse_list(mk.get("outcomes")))
         out.append({
             "platform": "PM", "title": label[:70],
+            "yes_book_sampled_at": sampled_at, "no_book_sampled_at": None,
+            "quote_sampled_at": ev.get("_sampled_at"),
             "question": (mk.get("question") or "")[:90],
             "yes_bid": bid, "yes_ask": ask,
             "no_bid": None, "no_ask": None,
@@ -225,54 +251,79 @@ def polymarket_rows(tags, per_tag, keep, max_spread, tail):
     top = sorted(out, key=lambda r: -r["vol24h"])[:NO_BOOKS]
     with ThreadPoolExecutor(max_workers=3) as pool:
         no_books = list(pool.map(
-            lambda r: _pm_no_book(next(m[1] for m in markets if m[1].get("id") == r["id"])),
+            lambda r: _safe(lambda: _pm_book(
+                next(m[1] for m in markets if m[1].get("id") == r["id"]), 1, cache),
+                f"NO book {r['id']}"),
             top))
-    for r, (nb, na) in zip(top, no_books):
+    for r, (book, error) in zip(top, no_books):
+        if error:
+            errors.append(error)
+        nb, na, sampled_at = book or ([], [], None)
+        r["no_book_sampled_at"] = sampled_at
         if na:
             r["no_ask"], r["no_bid"] = na[0][0], nb[0][0] if nb else None
             r["no_fill"] = full_fill(na, shares=SHARES)
-    return out
+    return out, errors
 
 
 # ---------------------------------------------------------------- kalshi
 
-def kalshi_book(ticker, shares):
+def kalshi_book(ticker, shares, *, strict=False):
     """Kalshi /orderbook returns BIDS per side; YES asks come from inverting NO bids."""
     try:
         data = http_json(f"{KALSHI}/markets/{urllib.parse.quote(ticker)}/orderbook?depth=20")
     except FetchError:
+        if strict:
+            raise
         return None
     fp = data.get("orderbook_fp") or {}
     no_bids = sorted(((float(p), float(sz)) for p, sz in fp.get("no_dollars") or []),
                      reverse=True)
     yes_asks = [(round(1.0 - p, 4), sz) for p, sz in no_bids if p > 0]
-    return full_fill(sorted(yes_asks), shares=shares) if yes_asks else None
+    fill = full_fill(sorted(yes_asks), shares=shares) if yes_asks else None
+    if fill is not None:
+        fill["sampled_at"] = utc_now()
+    return fill
 
 
 def _ka_markets(s: str, per_series: int):
     mk_url = (f"{KALSHI}/markets?status=open&limit={per_series}"
               f"&mve_filter=exclude&series_ticker={urllib.parse.quote(s)}")
-    return _safe(lambda: http_json(mk_url).get("markets") or [], f"series {s}")
+    def fetch():
+        markets = http_json(mk_url).get("markets") or []
+        sampled_at = utc_now()
+        return [dict(m, _sampled_at=sampled_at) for m in markets]
+    return _safe(fetch, f"series {s}")
 
 
 def _ka_titles(s: str):
     ev_url = (f"{KALSHI}/events?limit=40&status=open&series_ticker={urllib.parse.quote(s)}"
               f"&with_nested_markets=false")
-    events = _safe(lambda: http_json(ev_url).get("events") or [], f"events {s}")
-    return {e.get("event_ticker"): e.get("title") for e in events if e.get("event_ticker")}
+    events, error = _safe(lambda: http_json(ev_url).get("events") or [], f"events {s}")
+    return {e.get("event_ticker"): e.get("title") for e in (events or [])
+            if e.get("event_ticker")}, error
 
 
-def kalshi_rows(series, per_series, max_spread, tail, books=12):
+def kalshi_rows(series, per_series, max_spread, tail, books=12, query=""):
     out = []
+    errors = SourceErrors()
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         batches = list(pool.map(lambda s: _ka_markets(s, per_series), series))
     # Event titles are a nice-to-have; 2 workers avoids Kalshi TLS handshake limits.
     with ThreadPoolExecutor(max_workers=2) as pool:
         title_maps = list(pool.map(lambda s: _ka_titles(s), series))
-    titles = {s: m for s, m in zip(series, title_maps)}
-    for s, batch in zip(series, batches):
+    titles = {}
+    for s, (mapping, error) in zip(series, title_maps):
+        titles[s] = mapping
+        if error:
+            errors.append(error)
+    for s, (batch, error) in zip(series, batches):
+        if error:
+            errors.append(error)
+        else:
+            errors.discovery_ok += 1
         ev_titles = titles.get(s) or {}
-        for mk in batch:
+        for mk in batch or []:
             yb, ya = fnum(mk.get("yes_bid_dollars")), fnum(mk.get("yes_ask_dollars"))
             if ya is None:
                 nb0 = fnum(mk.get("no_bid_dollars"))
@@ -290,7 +341,11 @@ def kalshi_rows(series, per_series, max_spread, tail, books=12):
             no_depth = fnum(mk.get("yes_bid_size_fp")) or 0.0
             ev_title = ev_titles.get(mk.get("event_ticker")) or ""
             label = f"{ev_title}｜{mk.get('title')}" if ev_title else (mk.get("title") or "")
+            if not matches_query(label[:70], (mk.get("title") or "")[:90], query):
+                continue
             out.append({
+                "quote_sampled_at": mk.get("_sampled_at"),
+                "yes_book_sampled_at": None,
                 "platform": "KA", "title": label[:70],
                 "question": (mk.get("title") or "")[:90],
                 "yes_bid": yb, "yes_ask": ya, "no_bid": nb, "no_ask": na,
@@ -313,11 +368,16 @@ def kalshi_rows(series, per_series, max_spread, tail, books=12):
              and not (r["fill"]["complete"] or r["no_fill"]["complete"])]
     short.sort(key=lambda r: -r["vol24h"])
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        fills = list(pool.map(lambda r: kalshi_book(r["id"], SHARES), short[:books]))
-    for r, fill in zip(short[:books], fills):
+        fills = list(pool.map(lambda r: _safe(
+            lambda: kalshi_book(r["id"], SHARES, strict=True),
+            f"orderbook {r['id']}"), short[:books]))
+    for r, (fill, error) in zip(short[:books], fills):
+        if error:
+            errors.append(error)
         if fill:
             r["fill"] = fill
-    return out
+            r["yes_book_sampled_at"] = fill["sampled_at"]
+    return out, errors
 
 
 # ---------------------------------------------------------------- verdict
@@ -364,8 +424,8 @@ def render(rows, max_spread, top, xmatch):
     watch = [r for r in rows if r not in live]
     live.sort(key=lambda r: -r["vol24h"])
     lines = [
-        "| 平台 | 对象·周期(收盘) | 两侧 ask/bid | 20份 Y/N | 费用 | 24h量 | 状态 |",
-        "|---|---|---|---|---|---|---|",
+        "| 平台 | 对象·周期(收盘) | 两侧 ask/bid | 20份 Y/N | 费用 | 24h量 | 状态 | 采样UTC(Y/N/列表) |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for r in live[:top]:
         lines.append("| " + " | ".join([
@@ -376,6 +436,8 @@ def render(rows, max_spread, top, xmatch):
             r["fee"],
             f"{r['vol24h']:,.0f}{r['vol_unit']}",
             verdict(r, max_spread),
+            "/".join(str(r.get(key) or "-") for key in
+                     ("yes_book_sampled_at", "no_book_sampled_at", "quote_sampled_at")),
         ]) + " |")
     lines.append("")
     lines.append(f"可挂单 {len(live)} 个；观察区 {len(watch)} 个。"
@@ -421,39 +483,70 @@ def main():
     ap.add_argument("--tail", action="store_true", help="allow <10c / >90c (high-odds mode)")
     ap.add_argument("--no-x", action="store_true", help="skip cross-platform matching")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--json-limit", type=int, default=None, help="optional JSON row limit (0 allowed)")
+    ap.add_argument("--compact-json", action="store_true", help="JSON without rules/question and whitespace")
     args = ap.parse_args()
+    if args.json_limit is not None and args.json_limit < 0:
+        ap.error("--json-limit must be nonnegative")
     SHARES, NO_BOOKS = args.shares, args.no_books
 
     t0 = time.time()
-    rows = []
+    rows, errors = [], []
+    discovery_ok = 0
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = []
         if args.platform in ("both", "polymarket"):
-            futures.append(pool.submit(polymarket_rows, csv(args.tag), args.per_tag,
-                                       args.keep, args.max_spread, args.tail))
+            futures.append(("Polymarket", pool.submit(
+                polymarket_rows, csv(args.tag), args.per_tag, args.keep,
+                args.max_spread, args.tail, query=args.query)))
         if args.platform in ("both", "kalshi"):
-            futures.append(pool.submit(kalshi_rows, csv(args.series), args.per_series,
-                                       args.max_spread, args.tail))
-        for fut in futures:
-            rows += fut.result()
+            futures.append(("Kalshi", pool.submit(
+                kalshi_rows, csv(args.series), args.per_series,
+                args.max_spread, args.tail, query=args.query)))
+        for name, future in futures:
+            try:
+                result, source_errors = future.result()
+                rows.extend(result)
+                discovery_ok += source_errors.discovery_ok
+                errors.extend(f"{name}: {err}" for err in source_errors)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
     if args.query:
         q = args.query.lower()
         rows = [r for r in rows if q in (r["title"] + r["question"]).lower()]
     closed = [r for r in rows if horizon(r["close"]) == "已收盘"]
     rows = [r for r in rows if horizon(r["close"]) != "已收盘"]
     elapsed = time.time() - t0
+    completed_at = utc_now()
+    if errors:
+        print(f"数据源错误（{len(errors)}个）：", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        if not discovery_ok:
+            print("错误：所有发现请求均失败，无法生成报告", file=sys.stderr)
+            return 1
+        print("部分数据可用；报告覆盖不完整。", file=sys.stderr)
 
     if args.json:
         for r in rows:
             r["horizon"] = horizon(r["close"])
             r["verdict"] = verdict(r, args.max_spread)
             r["close_utc"] = when(r["close"])
-        print(json.dumps({"elapsed_s": round(elapsed, 1), "rows": rows},
-                         ensure_ascii=False, default=str))
+        total_rows = len(rows)
+        if args.json_limit is not None:
+            rows = rows[:args.json_limit]
+        if args.compact_json:
+            rows = [{k: v for k, v in r.items() if k not in ("rules", "question")} for r in rows]
+        print(json.dumps({"elapsed_s": round(elapsed, 1), "rows": rows,
+                          "completed_at": completed_at, "errors": errors,
+                          "total_rows": total_rows, "returned_rows": len(rows)},
+                         ensure_ascii=False, default=str,
+                         separators=(",", ":") if args.compact_json else None))
         return 0
     print(f"# pm-liquid 扫描 {len(rows)} 个候选（{elapsed:.0f}s，{int(SHARES)}份执行检查，"
           f"价差≤{args.max_spread * 100:.0f}c，价格带{'含长尾' if args.tail else '10-90c'}"
           f"{'，剔除已收盘 ' + str(len(closed)) + ' 个' if closed else ''}）")
+    print(f"扫描完成 UTC {completed_at}；数据源错误 {len(errors)} 个。")
     print(render(rows, args.max_spread, args.top, not args.no_x))
     return 0
 

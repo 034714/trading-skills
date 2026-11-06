@@ -262,5 +262,62 @@ class BatchMapping(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class PlausibleCandidateGate(unittest.TestCase):
+    """The book-fetch gate must rank by the centre scenario (p_calibrated),
+    not the pessimistic drift bound (p_min), or forecast-adjacent brackets
+    get dropped before their book is ever read."""
+
+    def test_centre_adjacent_bracket_survives_low_pmin(self):
+        import pm_weather
+        # Busan 11/6 15C bracket: centre prob 0.28 vs ask 0.17 (real edge),
+        # but a downside drift makes p_min only 0.118. The old p_min gate
+        # compared 0.118-0.17 = -0.05 < -0.02 and silently dropped it.
+        row = {"label": "15°C", "ask": 0.17, "bid": 0.15,
+               "p_min": 0.118, "p_max": 0.45, "p_calibrated": 0.278}
+        self.assertIn(row, pm_weather.plausible_candidates([row]))
+
+    def test_gate_uses_pmin_when_no_calibrated(self):
+        import pm_weather
+        row = {"label": "14°C", "ask": 0.04, "bid": 0.02,
+               "p_min": 0.19, "p_max": 0.48}
+        self.assertIn(row, pm_weather.plausible_candidates([row]))
+
+    def test_no_edge_either_side_dropped(self):
+        import pm_weather
+        # Model and market both ~0 for this bracket: no YES edge, no NO edge.
+        row = {"label": "10°C", "ask": 0.05, "bid": 0.02,
+               "p_min": 0.0, "p_max": 0.01, "p_calibrated": 0.01}
+        self.assertNotIn(row, pm_weather.plausible_candidates([row]))
+
+    def test_no_side_value_kept(self):
+        import pm_weather
+        # Market overprices a warm bracket: NO side has edge even though YES doesn't.
+        row = {"label": "17°C", "ask": 0.39, "bid": 0.37,
+               "p_min": 0.0, "p_max": 0.10, "p_calibrated": 0.095}
+        self.assertIn(row, pm_weather.plausible_candidates([row]))
+
+
+class PrewarmBudget(unittest.TestCase):
+    """A degraded IEM link drops multi-MB reads (IncompleteRead), so the per-read
+    timeout never fires and retries re-download forever. The wall-clock budget
+    must short-circuit fetches once blown, instead of grinding for tens of minutes."""
+
+    def test_expired_deadline_short_circuits_fetch(self):
+        import pm_weather
+        import time
+        pm_weather._PREWARM_DEADLINE = time.time() - 1.0  # already expired
+        try:
+            with self.assertRaises(pm_weather.FetchError):
+                pm_weather.cached_text("budget_test_key_no_cache",
+                                       "https://example.com/weather")
+        finally:
+            pm_weather._PREWARM_DEADLINE = None
+
+    def test_no_deadline_does_not_raise(self):
+        # Outside prewarm the deadline is None; cached_text must not short-circuit.
+        import pm_weather
+        self.assertIsNone(pm_weather._PREWARM_DEADLINE)
+
+
 if __name__ == "__main__":
     unittest.main()

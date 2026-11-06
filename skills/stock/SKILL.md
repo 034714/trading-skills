@@ -1,9 +1,13 @@
 ---
 name: stock
-description: Gate 股票类 USDT 永续只读研究（美股/港股/指数/未上市公司）。支持主动发现可交易标的、联网新闻/宏观局势/财报核查、日线/4H/1H、结构目标与持有周期条件卡；资金费周期以合约字段为准。Use when the user asks 股票、美股、港股、中概、股票永续、Gate股票、财报、新闻对股票的影响、有什么股票机会、目标价、持仓复查、加仓减仓。Do NOT use for 加密货币（用 trade）、预测市场（用 pm-edge）、券商实盘或 Gate 美股 16×5 通道。
+description: Gate 股票类 USDT 永续只读研究（美股/港股/指数/未上市公司）。支持主动发现可交易标的、联网新闻/宏观局势/财报核查、日线/4H/1H、结构目标与持有周期条件卡；资金费周期以合约字段为准。Use when the user asks 股票、美股、港股、中概、股票永续、Gate股票、财报、新闻对股票的影响、有什么股票机会、目标价、持仓复查、加仓减仓。Do NOT use for 加密货币（用 trade）、预测市场（天气用 pm-weather，流动性事件合约用 pm-liquid）、券商实盘或 Gate 美股 16×5 通道。
 ---
 
 # stock — Gate 股票永续条件研究
+
+## 每次任务收尾
+
+完成或中断都检查本轮文件与程序。删除本轮确认的一次性下载、临时脚本、测试缓存；仅停止本轮启动且已不需要的子进程/服务器，关闭本轮专用浏览器标签页，不关闭用户已有应用或其他任务。正式产物、用户记录及所有 `.mimosa/` 保留；归属不明不删。命令优先 `python -B`，不额外保存行情。最终简报删除/保留/归档及仍运行项；不能把规则说明当成已执行清理。
 
 ## 边界
 
@@ -48,7 +52,9 @@ description: Gate 股票类 USDT 永续只读研究（美股/港股/指数/未�
 - `data_quality` 带源K线起止、年龄、过期标记；Yahoo按工作日时钟检查，异常可因假期，不可静默当新鲜。Gate连续时钟超1.5个周期标陈旧；无K线标unavailable。查询时间不等于源行情时间，Yahoo底层价另看 `price_time_unix`（缺失为未知）。
 - `event_research` 默认 not_checked，代表脚本未做新闻研究，不代表助手联网后仍未查。回答中的人工核查应另列证据，不修改行情事实。
 - 无合约/非股票/两层日线不足15根进 `partial_failures`；全部失败状态码2。Yahoo不可用自动回退并警告。
-- 离线回归 `python -B -m unittest discover -s tests -v`，不联网、不访问账户。测试文件含3个真实提示的规则评估，不等于fresh会话模型效果评测。
+- **省 token 命令**：初筛 `python -B scripts/stock_ctx.py --list --sort volume --top 12`；深看摘要 `python -B scripts/stock_ctx.py --symbols AAPL,NVDA`（示例非推荐）。不加 `--json` 即用已有可读摘要；程序消费才加 `--json`，同轮不要为换格式重跑。`--top`、`--min-volume`、`--underlying-only` 仅在整表取回后过滤/截断输出，不减少合约/行情整表请求；选少量 `--symbols` 才限制深看K线范围。
+- 合约列表仅进程内成功缓存，首次并发加载加锁避免成功取数重复；失败不缓存，后续调用仍可重试，不落磁盘。不同命令进程不共享缓存。
+- 离线回归 `python -B -m pytest -p no:cacheprovider tests -q`，不联网、不访问账户。测试文件含3个真实提示的规则评估，不等于fresh会话模型效果评测。
 
 ## 参考
 

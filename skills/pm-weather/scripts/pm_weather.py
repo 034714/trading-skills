@@ -21,8 +21,8 @@ drift included. Rows that lose their edge there are research-only (--risky
 shows them); there is no far-bracket exemption.
 
 Batch replies are mapped to stations by coordinate and fail closed on mismatch;
-cache files live under a versioned namespace so older contaminated data is never
-read back.
+cache defaults to process memory; opt-in disk files use a versioned namespace
+so former installation-local caches are never read back.
 
 `--settle YYYY-MM-DD` checks each station's completed local day: provisional
 IEM/HKO observations, bracket mapping, and an eligible prediction-snapshot centre.
@@ -67,13 +67,32 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pm_common import (UA, GAMMA, CLOB, http_json, as_float,
-                       analyze_books, markdown_cell)
+                       analyze_books, markdown_cell, FetchError)
 
 CACHE_SCHEMA = "weather-v3-validated"
-CACHE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
-# Old raw, parsed, stats and history files stay untouched and are never trusted here.
-CACHE = os.path.join(CACHE_ROOT, CACHE_SCHEMA)
-os.makedirs(CACHE, exist_ok=True)
+from pm_weather_storage import (storage_paths, cache_fresh, read_cache, cache_mode,
+                                write_cache, atomic_text, store_rule)
+
+# Resolve only: --help/import never mkdir. Never read the former skill-local cache.
+_CACHE_BASE, DATA = storage_paths()
+CACHE_ROOT = str(_CACHE_BASE)
+CACHE = str(_CACHE_BASE / CACHE_SCHEMA)
+
+
+CACHE_MODE = cache_mode()
+SAVE_RECORDS = False
+
+
+def _cache_fresh(path, hours):
+    return cache_fresh(path, hours, CACHE_MODE)
+
+
+def _read_cache(path):
+    return read_cache(path, CACHE_MODE)
+
+
+def _write_cache(path, text):
+    write_cache(path, text, CACHE, DATA, CACHE_MODE)
 _PREWARM_FAILED = set()
 LOCK = threading.Lock()
 # Open-Meteo allows 600 calls/min but 429s on bursts; batching cut the per-scan
@@ -81,6 +100,15 @@ LOCK = threading.Lock()
 _OM_SLOT = threading.Semaphore(4)
 # IEM's ASOS archive tolerates more parallelism and is the bulk of the download.
 _IEM_SLOT = threading.Semaphore(6)
+
+# Wall-clock deadline for the bulk prewarm, set by prewarm() and read by
+# cached_text(). None outside prewarm so settle/HKO fetches are never affected.
+# Why: when IEM is degraded it accepts a multi-MB read then drops it
+# (IncompleteRead at 2-6MB), so the per-read timeout never fires and the retry
+# loop re-downloads the same huge payload over and over -- a full 40-city scan
+# once ground for 1947s and still returned empty tables. The budget makes a
+# broken network bail early and report, instead of silently grinding.
+_PREWARM_DEADLINE = None
 
 MODELS = ("ecmwf_ifs025", "gfs_seamless", "icon_seamless")
 ENS_NAME = {"ecmwf_ifs025": "ecmwf_ifs025", "gfs_seamless": "gfs025", "icon_seamless": "icon_seamless"}
@@ -139,12 +167,11 @@ def _validate_url(url: str) -> str:
 def cached(key: str, url: str, ttl_hours: float = 3.0):
     path = _cache_path(key, ".json")
     p = pathlib.Path(path)
-    if p.exists():
-        if (datetime.now().timestamp() - p.stat().st_mtime) / 3600 < ttl_hours:
-            try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+    if _cache_fresh(p, ttl_hours):
+        try:
+            return json.loads(_read_cache(p))
+        except Exception:
+            pass
     data = None
     for attempt in range(4):
         try:
@@ -156,20 +183,29 @@ def cached(key: str, url: str, ttl_hours: float = 3.0):
                 time.sleep(2.0 * (attempt + 1))   # ensemble API bursts get throttled
                 continue
             raise
-    p.write_text(json.dumps(data), encoding="utf-8")
+    _write_cache(p, json.dumps(data))
     return data
 
 
-def cached_text(key: str, url: str, ttl_hours: float = 6.0, timeout: float = 120.0):
+def cached_text(key: str, url: str, ttl_hours: float = 6.0, timeout: float = 40.0):
+    # timeout is per-read. It used to be 120s, so one hung IEM read (IncompleteRead
+    # on a flaky link) could block 3 retries x 120s ~ 360s for a SINGLE url. Across
+    # an 82-event full-city scan the prewarm then ran past 280s with no output --
+    # exactly the "keep grinding on a broken network" failure the scan must avoid.
+    # 40s is still generous for these small CSV/JSON responses and matches the 35s
+    # default in pm_common.http_json, so a dead fetch now fails fast and the
+    # guarded() retry/exclusion path reports it instead of stalling the whole run.
     path = _cache_path(key, ".txt")
     p = pathlib.Path(path)
-    if p.exists():
-        if (datetime.now().timestamp() - p.stat().st_mtime) / 3600 < ttl_hours:
-            return p.read_text(encoding="utf-8")
+    if _cache_fresh(p, ttl_hours):
+        return _read_cache(p)
     req = urllib.request.Request(_validate_url(url), headers={"User-Agent": UA})
     slot = _IEM_SLOT if "mesonet.agron" in url else _OM_SLOT
     text, last = None, None
     for attempt in range(3):          # proxies hiccup; a dead fetch should not kill a scan
+        if _PREWARM_DEADLINE is not None and time.time() > _PREWARM_DEADLINE:
+            # Budget blown: stop re-downloading huge payloads that keep dropping.
+            raise FetchError("prewarm 预算耗尽，停止重试")
         try:
             with slot:
                 with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -177,10 +213,12 @@ def cached_text(key: str, url: str, ttl_hours: float = 6.0, timeout: float = 120
             break
         except Exception as exc:
             last = exc
+            if _PREWARM_DEADLINE is not None and time.time() > _PREWARM_DEADLINE:
+                break
             time.sleep(0.8 * (attempt + 1))
     if text is None:
         raise last
-    p.write_text(text, encoding="utf-8")
+    _write_cache(p, text)
     return text
 
 
@@ -216,19 +254,20 @@ _OBS_MEMO: dict = {}
 def observed_daily(station: str, zone: str, start: date, end: date):
     """Routine-METAR daily extremes in the station's local day (memoized; both max and min)."""
     key = (station, start, end)
-    if key in _OBS_MEMO:
+    if CACHE_MODE != "off" and key in _OBS_MEMO:
         return _OBS_MEMO[key]
     path = os.path.join(CACHE, f"asos_{station}_{start}_{end}.csv")
     p = pathlib.Path(path)
-    if not p.exists():
+    if not _cache_fresh(p, 72):
         url = ("https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?"
                f"station={station}&data=tmpc,metar"
                f"&year1={start.year}&month1={start.month}&day1={start.day}"
                f"&year2={end.year}&month2={end.month}&day2={end.day}"
                "&tz=UTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no")
         text = cached_text(f"asosraw_{station}_{start}_{end}", url, ttl_hours=72)
-        p.write_text(text, encoding="utf-8")
-    text = p.read_text(encoding="utf-8")
+        _write_cache(p, text)
+    else:
+        text = _read_cache(p)
     tz = ZoneInfo(zone)
     us = station.startswith("K")
     hi, lo, cnt = {}, {}, {}
@@ -526,7 +565,9 @@ def _snap_fnd(fc: dict):
     file eventually yields a real HKO-forecast error sigma to replace the
     grid-residual proxy (HKO scores its own forecasts full marks within 1.5 C,
     so a ~1 C official miss is ordinary and must not be treated as 5-sigma)."""
-    path = pathlib.Path(CACHE, "hko_fnd_history.jsonl")
+    if not SAVE_RECORDS:
+        return
+    path = pathlib.Path(DATA, "hko_fnd_history.jsonl")
     have = set()
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -540,6 +581,7 @@ def _snap_fnd(fc: dict):
              for d, (mx, mn) in fc.items() if (issued, d.isoformat()) not in have]
     if fresh:
         with LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as fh:
                 for rec in fresh:
                     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -605,12 +647,12 @@ def hk_model(target: date):
 def prev_all_models(station: str, zone: str, start: date, end: date):
     """One request for all three models' previous_day1 series (max and min daily)."""
     key = (station, start, end)
-    if key in _PREV_ALL:
+    if CACHE_MODE != "off" and key in _PREV_ALL:
         return _PREV_ALL[key]
     pp = pathlib.Path(CACHE, f"prevparse_{station}_{start}_{end}.json")
-    if pp.exists() and (time.time() - pp.stat().st_mtime) < 3600 * 3:
+    if _cache_fresh(pp, 3):
         try:
-            raw = json.loads(pp.read_text(encoding="utf-8"))
+            raw = json.loads(_read_cache(pp))
             out = {}
             for model, v in raw.items():
                 out[model] = {"max": {date.fromisoformat(d): x for d, x in v["max"].items()},
@@ -655,13 +697,13 @@ _PREV_ALL: dict = {}
 def members_all_models(station: str, zone: str, target: date, variable: str):
     """One request for all three models' ensemble members."""
     key = (station, target, variable)
-    if key in _MEM_ALL:
+    if CACHE_MODE != "off" and key in _MEM_ALL:
         return _MEM_ALL[key]
     mp = pathlib.Path(CACHE, f"memparse_{station}_{target}_{variable}.json")
-    if mp.exists() and (time.time() - mp.stat().st_mtime) < 3600 * 3:
+    if _cache_fresh(mp, 3):
         try:
             with LOCK:
-                _MEM_ALL[key] = json.loads(mp.read_text(encoding="utf-8"))
+                _MEM_ALL[key] = json.loads(_read_cache(mp))
             return _MEM_ALL[key]
         except Exception:
             pass
@@ -743,7 +785,7 @@ def _batch_cache_key(prefix, zone, stations, *params):
     return f"{prefix}_{zone}_{json.dumps(identity,separators=(',',':'))}_{'_'.join(map(str, params))}"
 
 
-def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
+def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4, budget=None):
     """Pull everything the pricing pass needs in bulk, before the per-event pool.
 
     previous_day1 and the ensembles go out as one multi-location request per
@@ -756,6 +798,10 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
     groups: dict[str, list] = {}
     for c in codes:
         groups.setdefault(STATIONS[c]["tz"], []).append(c)
+
+    global _PREWARM_DEADLINE
+    if budget:
+        _PREWARM_DEADLINE = time.time() + budget
 
     def prev_one(zone, sts):
         q = urllib.parse.urlencode({
@@ -787,10 +833,10 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
                 continue
             with LOCK:
                 _PREV_ALL[(st, obs_start, obs_end)] = per
-            pathlib.Path(CACHE, f"prevparse_{st}_{obs_start}_{obs_end}.json").write_text(
+            _write_cache(pathlib.Path(CACHE, f"prevparse_{st}_{obs_start}_{obs_end}.json"),
                 json.dumps({m: {"max": {d.isoformat(): x for d, x in v["max"].items()},
                                 "min": {d.isoformat(): x for d, x in v["min"].items()}}
-                            for m, v in per.items()}), encoding="utf-8")
+                            for m, v in per.items()}))
 
     def ens_one(zone, sts):
         q = urllib.parse.urlencode({
@@ -810,8 +856,8 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
                     continue
                 with LOCK:
                     _MEM_ALL[(st, target, variable)] = per
-                pathlib.Path(CACHE, f"memparse_{st}_{target}_{variable}.json").write_text(
-                    json.dumps(per), encoding="utf-8")
+                _write_cache(pathlib.Path(CACHE, f"memparse_{st}_{target}_{variable}.json"),
+                             json.dumps(per))
 
     def iem_one(sts):
         for i in range(0, len(sts), 6):
@@ -834,8 +880,8 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
                     out[st].append(",".join(r))
             with LOCK:
                 for c, lines in out.items():
-                    pathlib.Path(CACHE, f"asos_{c}_{obs_start}_{obs_end}.csv").write_text(
-                        "\n".join(lines) + "\n", encoding="utf-8")
+                    _write_cache(pathlib.Path(CACHE, f"asos_{c}_{obs_start}_{obs_end}.csv"),
+                                 "\n".join(lines) + "\n")
 
     def guarded(fn_factory, label, sts, cache_ok):
         def _do():
@@ -848,34 +894,40 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
             return (fn_factory, label, sts, cache_ok)
 
     def have_prev(sts):
-        return all(pathlib.Path(CACHE, f"prevparse_{st}_{obs_start}_{obs_end}.json").exists()
+        return all(_cache_fresh(pathlib.Path(CACHE, f"prevparse_{st}_{obs_start}_{obs_end}.json"), 3)
                    for st in sts)
 
     def have_ens(sts):
-        return all(pathlib.Path(CACHE, f"memparse_{st}_{target}_{v}.json").exists()
+        return all(_cache_fresh(pathlib.Path(CACHE, f"memparse_{st}_{target}_{v}.json"), 3)
                    for st in sts
                    for v in ("temperature_2m_max", "temperature_2m_min"))
 
     def have_iem(sts):
-        return all(pathlib.Path(CACHE, f"asos_{st}_{obs_start}_{obs_end}.csv").exists()
+        return all(_cache_fresh(pathlib.Path(CACHE, f"asos_{st}_{obs_start}_{obs_end}.csv"), 72)
                    for st in sts)
 
     failed = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        jobs = []
-        for zone, sts in groups.items():
-            jobs.append(pool.submit(guarded, (lambda s, z=zone: prev_one(z, s)), "前一天预报", sts, have_prev))
-            jobs.append(pool.submit(guarded, (lambda s, z=zone: ens_one(z, s)), "集合成员", sts, have_ens))
-        jobs.append(pool.submit(guarded, (lambda s: iem_one(s)), "IEM 观测", codes, have_iem))
-        failed = [r for r in (j.result() for j in jobs) if r]
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            jobs = []
+            for zone, sts in groups.items():
+                jobs.append(pool.submit(guarded, (lambda s, z=zone: prev_one(z, s)), "前一天预报", sts, have_prev))
+                jobs.append(pool.submit(guarded, (lambda s, z=zone: ens_one(z, s)), "集合成员", sts, have_ens))
+            jobs.append(pool.submit(guarded, (lambda s: iem_one(s)), "IEM 观测", codes, have_iem))
+            failed = [r for r in (j.result() for j in jobs) if r]
 
-    # 429 限流兜底：歇一口气，用更低的并发把失败的组重来一次
-    if failed:
-        time.sleep(20.0)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            second = [pool.submit(guarded, fn, label, sts, cache_ok)
-                      for fn, label, sts, cache_ok in failed]
-            failed = [r for r in (j.result() for j in second) if r]
+        # 429 限流兜底：歇一口气，用更低的并发把失败的组重来一次。
+        # 预算耗尽时不再重试——坏网络下重试只会反复重下几 MB 又断掉的响应。
+        if failed and not (_PREWARM_DEADLINE is not None and time.time() > _PREWARM_DEADLINE):
+            time.sleep(20.0)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                second = [pool.submit(guarded, fn, label, sts, cache_ok)
+                          for fn, label, sts, cache_ok in failed]
+                failed = [r for r in (j.result() for j in second) if r]
+    finally:
+        # Clear the deadline so the post-prewarm pricing/settle fetches (which are
+        # not part of the bulk warm-up) are never short-circuited by it.
+        _PREWARM_DEADLINE = None
 
     # 仍失败时按"盘面是否已有缓存"分级提示：有缓存=数据旧一点但结论还作数；
     # 没缓存才真正不可靠（静默降级会让概率算在残缺数据上，10-25 曾有 4 个时区
@@ -895,16 +947,16 @@ def prewarm(codes, target: date, obs_start: date, obs_end: date, workers=4):
 
 
 def station_stats(code: str, kind: str, target: date, obs_start: date, obs_end: date):
-    """Bias / sigma / member samples per model, memoized on disk for the trading day.
+    """Bias / sigma / member samples per model, memoized in process memory by default.
 
     The expensive part of a scan is re-deriving these for every bracket; they only
     depend on (station, kind, target), so one computation serves the whole ladder.
     """
     tag = hashlib.sha256(f"{code}|{kind}|{target}|{obs_start}|{obs_end}".encode()).hexdigest()[:24]
     p = pathlib.Path(CACHE, "stats_" + tag + ".json")
-    if p.exists() and (datetime.now().timestamp() - p.stat().st_mtime) < 3600 * 6:
+    if _cache_fresh(p, 6):
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            return json.loads(_read_cache(p))
         except Exception:
             pass
 
@@ -929,7 +981,7 @@ def station_stats(code: str, kind: str, target: date, obs_start: date, obs_end: 
         per_model[model] = {"bias": mean(resid), "sigma": pstdev(resid),
                             "members": mem, "n": len(paired)}
     result = {"per_model": per_model}
-    p.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    _write_cache(p, json.dumps(result, ensure_ascii=False))
     return result
 
 
@@ -1168,6 +1220,31 @@ def _fee_ok(r, spend, fee_rate, side="yes") -> bool:
     return bool(price) and fee <= 0.02 * price * spend
 
 
+def plausible_candidates(rows, tol=0.02):
+    """Brackets worth fetching an order book for.
+
+    The gate MUST rank by the same probability the candidate tables use
+    (p_calibrated, the centre scenario), not the pessimistic drift bound p_min.
+    Gating on p_min silently drops a bracket that sits right next to the forecast
+    centre whenever a downside drift makes its worst-case bound small -- e.g. a
+    15C bracket beside a 14.9C centre -- so the full bracket distribution the
+    methodology requires never gets shown. Missing brackets are not the same as
+    brackets with no edge; this pre-filter only decides which books to read.
+    """
+    out = []
+    for r in rows:
+        p_yes = r.get("p_calibrated", r.get("p_min", 0.0)) or 0.0
+        p_no = r.get("p_calibrated", r.get("p_max", 0.0))
+        p_no = p_no if p_no is not None else 1.0
+        ask = r.get("ask")
+        bid = r.get("bid")
+        yes_ok = p_yes - (ask if ask is not None else 1.0) > -tol
+        no_ok = (1 - p_no) - (1 - (bid if bid is not None else 0.0)) > tol
+        if yes_ok or no_ok:
+            out.append(r)
+    return out
+
+
 def fmt_table(rows, spend, min_edge, mode, top, max_spread, risky=False,
               discount_ticks=0, tick_size=None):
     def ok(r):
@@ -1345,22 +1422,34 @@ def _cached_centre(code, kind, target, obs_start, obs_end, unit):
     return min(matches, key=lambda x: x[0])[1] if matches else None
 
 
-FORECAST_HISTORY = pathlib.Path(CACHE, "forecast_snapshots.jsonl")
+FORECAST_HISTORY = pathlib.Path(DATA, "forecast_snapshots.jsonl")
 
 
 def snapshot_forecast(target, rows, captured_at=None):
     """Append observations of predictions; settlement never writes this ledger."""
+    if not SAVE_RECORDS:
+        return None
+    # Rule bodies are content-addressed once; keep caller rows unchanged.
+    compact_rows = []
+    for row in rows:
+        compact = dict(row)
+        rules = compact.pop("rules", None)
+        if rules:
+            compact["rules_sha256"] = store_rule(str(rules), FORECAST_HISTORY.parent)
+        compact_rows.append(compact)
     rec = {"snapshot_id": str(uuid.uuid4()), "target": target.isoformat(),
            "captured_at_utc": captured_at or datetime.now(ZoneInfo("UTC")).isoformat(),
            "model_issued_at": None, "model_issued_at_status": "源起报时间缺失，抓取时间不等于起报时间",
-           "probability_status": "未验证情景，非校准胜率", "rows": rows}
+           "probability_status": "未验证情景，非校准胜率", "rows": compact_rows,
+           "storage_schema": 2}
     with LOCK:
+        FORECAST_HISTORY.parent.mkdir(parents=True, exist_ok=True)
         with FORECAST_HISTORY.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     return rec["snapshot_id"]
 
 
-SETTLE_HISTORY = pathlib.Path(CACHE, "settle_history.jsonl")
+SETTLE_HISTORY = pathlib.Path(DATA, "settle_history.jsonl")
 
 
 def _append_history(records):
@@ -1368,7 +1457,7 @@ def _append_history(records):
 
     Re-running a date after HK's extract publishes just fills the gap -- no
     duplicates, so --bias stays clean."""
-    if not records:
+    if not SAVE_RECORDS or not records:
         return
     key = lambda r: (r["d"], r["code"], r["kind"], r.get("unit", "C"))
     fresh = {key(r): r for r in records}
@@ -1385,8 +1474,8 @@ def _append_history(records):
             if key(r) not in fresh:
                 old.append(r)
     rows = sorted(old + list(fresh.values()), key=lambda r: (r["d"], r["city"], r["kind"]))
-    SETTLE_HISTORY.write_text(
-        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+    atomic_text(SETTLE_HISTORY,
+                "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
 
 
 def _centre_hit_winner(r):
@@ -1411,7 +1500,7 @@ def _centre_hit_winner(r):
 def bias_report() -> int:
     """Replay settle history: how far the model centre lands from the actual."""
     if not SETTLE_HISTORY.exists():
-        print("还没有结算历史：--settle YYYY-MM-DD 仅记录待核验（pending）观测，不自动产生已验证回测证据。")
+        print("还没有结算历史：--settle YYYY-MM-DD 默认不保存；需 --save-records 显式留存待核验（pending）观测，不自动产生已验证回测证据。")
         return 1
     recs = []
     for line in SETTLE_HISTORY.read_text(encoding="utf-8").splitlines():
@@ -1427,7 +1516,7 @@ def bias_report() -> int:
     print(f"# 模型中心 vs 实际｜累计回测（{len(recs)} 条结算，其中 {len(graded)} 条有扫描时中心）\n")
     if not graded:
         print("还没有符合条件的回测行：需目标当地日开始前完成采集的预测快照，且结算源完整性已核验（verified）。")
-        print("--settle 当前仅写入待核验（pending）记录，不会自动成为已验证回测证据；旧扫描缓存不能替代预测快照。")
+        print("--settle --save-records 仅写入待核验（pending）记录，不会自动成为已验证回测证据；旧扫描缓存不能替代预测快照。")
         return 0
 
     def stat(rs):
@@ -1529,12 +1618,15 @@ def settle(target: date, only="") -> int:
                         "evidence_status": "pending_source_verification",
                         "centre_source": "prediction_snapshot" if centre is not None else None})
     _append_history(records)
-    if records:
+    if records and SAVE_RECORDS:
         print(f"\n已并入结算历史 {len(records)} 行 → {SETTLE_HISTORY.name}（--bias 看累计偏差回测）")
+    if records and not SAVE_RECORDS:
+        print("\n仅展示待核验结果，未保存结算历史（需 --save-records 显式开启）。")
     return 2 if failures or not records else 0
 
 
 def main() -> int:
+    global CACHE_MODE, SAVE_RECORDS
     ap = argparse.ArgumentParser(description="Weather bracket scanner (routine-METAR basis).")
     ap.add_argument("--date", default="", help="Target local date YYYY-MM-DD (default: tomorrow UTC).")
     ap.add_argument("--spend", type=float, default=20.0,
@@ -1555,6 +1647,11 @@ def main() -> int:
                     help="市场的价格 tick（如 0.001/0.01）。与 --discount-ticks 同时给才有意义。")
     ap.add_argument("--lookback", type=int, default=64, help="Days of history for bias/sigma.")
     ap.add_argument("--workers", type=int, default=4, help="Parallel stations (Open-Meteo rate limit).")
+    ap.add_argument("--prewarm-budget", type=float, default=300.0,
+                    help="Wall-clock seconds the bulk prewarm may spend before it stops "
+                         "retrying and excludes the unfinished cities. Guards against a "
+                         "degraded IEM/Open-Meteo link grinding for tens of minutes on "
+                         "multi-MB reads that keep dropping. 0 disables the budget.")
     ap.add_argument("--settle", default="",
                     help="Grade a finished date (YYYY-MM-DD) instead of scanning: actuals, "
                          "winning bracket, cached model centre.")
@@ -1563,7 +1660,12 @@ def main() -> int:
     ap.add_argument("--risky", action="store_true",
                     help="NO 表附带漂移脆弱档（默认过滤掉 ±1.5°C 就翻车的相邻档）。")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--cache-mode", choices=["memory", "disk", "off"], default=cache_mode(),
+                    help="Cache backend (default: process memory; disk is opt-in).")
+    ap.add_argument("--save-records", action="store_true",
+                    help="Explicitly save forecast/rules, HKO forecasts and pending settlement records.")
     args = ap.parse_args()
+    CACHE_MODE, SAVE_RECORDS = args.cache_mode, args.save_records
 
     target = (date.fromisoformat(args.date) if args.date
               else datetime.now(ZoneInfo("UTC")).date() + timedelta(days=1))
@@ -1587,7 +1689,8 @@ def main() -> int:
 
     t0 = time.time()
     _PREWARM_FAILED.clear()
-    prewarm([ev["code"] for ev in events], target, obs_start, obs_end, workers=args.workers)
+    prewarm([ev["code"] for ev in events], target, obs_start, obs_end, workers=args.workers,
+            budget=(args.prewarm_budget or None))
     print(f"prewarm {time.time() - t0:.1f}s", file=sys.stderr)
 
     rows = []
@@ -1610,9 +1713,8 @@ def main() -> int:
                 failures += 1
                 print(f"skip {ev['title']}: {type(exc).__name__} {exc}", file=sys.stderr)
 
-    # only bother reading books for plausible candidates
-    shortlist = [r for r in rows
-                 if (r["p_min"] - (r["ask"] or 1) > -0.02) or ((1 - r["p_max"]) - (1 - (r["bid"] or 0)) > 0.02)]
+    # Only bother reading books for plausible candidates.
+    shortlist = plausible_candidates(rows)
     attach_books(shortlist, args.spend, fee_per_share=args.fee_per_share,
                  discount_ticks=args.discount_ticks, tick_size=args.tick_size)
 

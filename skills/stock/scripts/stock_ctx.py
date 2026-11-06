@@ -14,6 +14,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 GATE = "https://api.gateio.ws/api/v4"
 YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart"
@@ -195,16 +196,19 @@ def ny_session(dt):
 
 
 _CONTRACT_CACHE = None
+_CONTRACT_LOCK = Lock()
 
 
 def fetch_contracts():
     global _CONTRACT_CACHE
-    if _CONTRACT_CACHE is None:
-        data = get(f"{GATE}/futures/usdt/contracts")
-        if not isinstance(data, list) or not data:
-            raise ValueError("Invalid contracts response")
-        _CONTRACT_CACHE = {c["name"]: c for c in data if isinstance(c, dict) and c.get("name")}
-    return _CONTRACT_CACHE
+    # Only successful responses are cached, in memory; failures remain retryable.
+    with _CONTRACT_LOCK:
+        if _CONTRACT_CACHE is None:
+            data = get(f"{GATE}/futures/usdt/contracts")
+            if not isinstance(data, list) or not data:
+                raise ValueError("Invalid contracts response")
+            _CONTRACT_CACHE = {c["name"]: c for c in data if isinstance(c, dict) and c.get("name")}
+        return _CONTRACT_CACHE
 
 
 def resolve_contract(symbol):

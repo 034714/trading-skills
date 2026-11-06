@@ -291,6 +291,7 @@ def parser():
     ap.add_argument("--auto", action="store_true", help="Construct conditional EMA-state scenarios, not predictions")
     for name in ("entry", "stop", "equity", "risk-pct", "max-leverage"):
         ap.add_argument("--" + name, type=float)
+    ap.add_argument("--no-options", action="store_true", help="Skip option-chain requests and option research; default includes options")
     ap.add_argument("--expiry-hint", default="")
     ap.add_argument("--min-days", type=float, default=3)
     ap.add_argument("--max-days", type=float, default=45)
@@ -322,6 +323,8 @@ def validate(args):
             raise ValueError("Stop must be below long entry or above short entry")
     elif args.entry is not None or args.stop is not None:
         raise ValueError("Entry/stop require long or short bias; neutral has no directional position")
+    if args.no_options and args.expiry_hint:
+        raise ValueError("--no-options cannot be combined with --expiry-hint")
     if args.expiry_hint:
         expiry_days(args.expiry_hint)
 
@@ -511,6 +514,10 @@ def build_symbol_report(args, symbol, now):
     live = report["live_snapshot"]
     if live.get("spot") and last:
         live["spot_vs_daily_close_pct"] = round((live["spot"] - last) / last * 100, 2)
+    if args.no_options:
+        report["options_status"] = "skipped_by_request"
+        report["options_fit_note"] = "Options research skipped by --no-options; IV not fetched or compared"
+        return report
     try:
         chain = option_chain(symbol)
         expiries = select_expiries(chain, args.min_days, args.max_days, args.expiry_hint, now)

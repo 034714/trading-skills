@@ -3,6 +3,8 @@ import importlib.util
 import io
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from datetime import datetime, timezone
 from pathlib import Path
 import unittest
@@ -63,6 +65,40 @@ class RegressionTests(unittest.TestCase):
                           gate_contract("AAPL_USDT", mark="196.0", index="195.9", pos="90000"),
                           gate_contract("MINIMAX_USDT", mark="23.8", index="23.7", pos="40000"),
                           gate_contract("BTC_USDT", ctype="")]
+
+    def test_first_concurrent_contract_fetch_is_shared(self):
+        start = Barrier(4)
+
+        def fetch(_):
+            start.wait(timeout=5)
+            return ctx.fetch_contracts()
+
+        def slow_get(url):
+            time.sleep(0.05)
+            return self.contracts
+
+        with patch.object(ctx, "get", side_effect=slow_get) as request:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(fetch, range(4)))
+        request.assert_called_once()
+        self.assertTrue(all(result is results[0] for result in results))
+        self.assertIn("AAPL_USDT", results[0])
+
+    def test_contract_failure_is_not_cached(self):
+        for failure in (OSError("offline"), ValueError("bad response")):
+            ctx._CONTRACT_CACHE = None
+            with patch.object(ctx, "get", side_effect=[failure, self.contracts]) as request:
+                with self.assertRaises(type(failure)):
+                    ctx.fetch_contracts()
+                self.assertIsNone(ctx._CONTRACT_CACHE)
+                self.assertIn("AAPL_USDT", ctx.fetch_contracts())
+                self.assertEqual(request.call_count, 2)
+        ctx._CONTRACT_CACHE = None
+        with patch.object(ctx, "get", side_effect=[[], self.contracts]):
+            with self.assertRaisesRegex(ValueError, "Invalid contracts"):
+                ctx.fetch_contracts()
+            self.assertIsNone(ctx._CONTRACT_CACHE)
+            self.assertIn("AAPL_USDT", ctx.fetch_contracts())
 
     def invoke(self, argv):
         out, err = io.StringIO(), io.StringIO()

@@ -2,24 +2,26 @@
 
 面向 AI 助手的四个只读交易研究技能。输出条件化计划，不自动交易，也不保证收益。
 
-- **pm-edge**：预测市场研究：天气、推文计数、奖项票房等日更或慢变量；明确事件日期，比较 YES / NO，先审计结算规则，再核对报价与费用。
+- **pm-weather**：天气预测市场只读研究，优先最高温、最低温和逐日温度档位；核实当地日期、结算站与来源，比较 YES / NO 完整盘口和条件回报。其他天气按需研究，不承诺已有专用模型。
 - **pm-liquid**：流动性优先的事件合约研究；同时读 Polymarket / Kalshi 两侧真实盘口，按价差与 20 份可成交深度筛选，默认挂被动限价，内置低价/高价屏幕与跨平台同事件比价。
 - **trade**：BTC / ETH（可扩展到其他币）技术与期权研究；一条命令带现价、资金费率、OI、多空比快照、1H/4H 日内背景与山寨币筛选；回复第一句就给「现在做什么」的大白话结论；区分行情快照、模型假设和可执行条件，不把指标或历史波动率比较直接当作买卖信号。
 - **stock**：Gate 股票类 USDT 永续（美股/港股/指数/未上市 AI 公司）条件研究；无默认标的，`--list` 查合约；一条命令带执行层快照（标记价 vs 指数锚溢价、按合约周期资金费、OI、多空账户数）、Yahoo 底层指标、1H 日内背景与美股时段状态；单一场所与财报未核查照直说。
 
 ## 安装
 
-从 [Releases](https://github.com/034714/trading-skills/releases) 的 **Assets** 下载所需的 `pm-edge.zip`、`pm-liquid.zip`、`trade.zip` 或 `stock.zip`，解压后将对应 skill 目录导入客户端（若支持目录导入），或复制到下述技能目录。每个 skill 根目录应直接包含 `SKILL.md`，避免多套一层目录。GitHub 自动生成的 **Source code (zip/tar.gz)** 是整个仓库源码，不是单个 skill 安装包；若下载源码，请使用其中 `skills/` 下对应目录。
+天气技能目录已改名为 `skills/pm-weather`。新名称安装包须实际发布后再下载，旧 Release 的 `pm-edge.zip` 不因此自动更名。安装请使用独立实体目录，不要建立指向开发项目的快捷方式或目录联接：删除开发仓库不应影响已安装技能。更新时重新导入，或按核对过的正式文件清单同步；安装副本不会自动跟随仓库修改。
 
-将 `skills/pm-edge`、`skills/pm-liquid`、`skills/trade` 和 `skills/stock` 复制到助手支持的 skill 目录，例如支持该路径的客户端使用 `~/.agents/skills/`；MiMo Desktop 可使用 `~/.config/mimocode/skills/`。具体路径以客户端文档为准，安装后确认已发现技能，不要同时安装同名的多份副本。
+从 [Releases](https://github.com/034714/trading-skills/releases) 的 **Assets** 下载所需的 `pm-weather.zip`、`pm-liquid.zip`、`trade.zip` 或 `stock.zip`，解压后将对应 skill 目录导入客户端（若支持目录导入），或复制到下述技能目录。每个 skill 根目录应直接包含 `SKILL.md`，避免多套一层目录。GitHub 自动生成的 **Source code (zip/tar.gz)** 是整个仓库源码，不是单个 skill 安装包；若下载源码，请使用其中 `skills/` 下对应目录。
+
+将 `skills/pm-weather`、`skills/pm-liquid`、`skills/trade` 和 `skills/stock` 复制到助手支持的 skill 目录，例如支持该路径的客户端使用 `~/.agents/skills/`；MiMo Desktop 可使用 `~/.config/mimocode/skills/`。具体路径以客户端文档为准，安装后确认已发现技能，不要同时安装同名的多份副本。
 
 直接运行脚本需要 Python 3.10+；脚本使用标准库，离线测试需安装 `pytest`。从仓库根目录运行下方命令；参数以脚本 `--help` 为准。取数需要访问各公开接口，不需要交易账户密钥。
 
 ## 怎么问
 
-- `/pm-edge 扫描明天的天气盘，看看有没有值得做的。`
-- `/pm-edge 只看纽约、东京、香港。`
-- `/pm-edge 这周有什么热门盘值得看？不看天气。`
+- `/pm-weather 扫描明天的天气盘，看看有没有值得做的。`
+- `/pm-weather 只看纽约、东京、香港，稳健但也要有合理赚头。`
+- `/pm-liquid 这周有什么流动性好的热门事件合约值得看？不看天气。`
 - `/pm-liquid 扫一下今晚和这周的深盘，优先能挂单的。`
 - `/pm-liquid 湖人这场两边盘口怎么样？能不能挂限价？`
 - `/trade BTC、ETH 现在什么结构？我想 79500 接多、止损 77800，给分批计划和期权适配。`
@@ -41,35 +43,34 @@ python skills/pm-liquid/scripts/scan.py --platform kalshi --series KXCPI,KXPAYRO
 
 输出每行：平台、对象·周期（UTC 收盘）、两侧 ask/bid、20 份 VWAP、费用、24h 量、状态（Y/N 可挂、深度不足、价差超限、价格屏）。Longshot、maker/taker、成交量口径与跨平台比价见 `skills/pm-liquid/references/playbook.md`。
 
-## 预测市场：通用发现 + 天气专用模型
+## pm-weather：温度盘优先的天气研究
 
-`pm-edge` 不只做天气。通用的盘（奖项、票房、体育、政治、推文计数）用发现工具看盘面事实：
+`pm-weather` 专注天气，优先最高温、最低温与逐日温度档位；降水、风速等仅按需核实规则、数据与证据，不承诺已有专用模型或自动扫描支持。非天气事件不属本 skill：体育、宏观、政治、加密价格等流动性合约转 `pm-liquid` 的已有流程；推文、奖项、票房不再由天气 skill 承接，也不据此承诺其他 skill 有专用模型。现有通用脚本保留。
 
-```bash
-python skills/pm-edge/scripts/pm_scan.py --tag awards --top 8 --books 8
-python skills/pm-edge/scripts/pm_scan.py --query "tweet,posts" --top 8
-```
+首次没有偏好时只问一个选择题：稳健有赚头（推荐）/均衡/高赔率；已有偏好不重复问，直接扫描或不能交互时默认稳健且重视条件回报，不保证收益。默认展示 3–6 个候选，不是上限，不凑数；按证据稳健性、条件回报、流动性与不确定性安排行序，不另设排序列。
 
-输出每行的本侧买价/卖价、价差、成交量、费用状态，以及两个**挂单流动性占比**（买盘 NO 占比 / 卖盘 NO 占比）。这两个数字是"最优价 2¢ 内的美元挂单占比"，用来判断流动性厚薄和挂单拥挤，**不是人数、信心或胜率**。
-
-天气盘额外有概率模型（三模式集合成员 + 滚动偏差修正），但只是模型情景，不是实测概率：
+天气扫描、结算与诊断统一用 `pm_weather.py`：
 
 ```bash
-python skills/pm-edge/scripts/pm_weather.py --date YYYY-MM-DD --top 10  # 替换为目标当地日期；费用另核实
-python skills/pm-edge/scripts/pm_weather.py --settle YYYY-MM-DD        # 仅已结束且结果已发布的当地日
-python skills/pm-edge/scripts/pm_weather.py --bias                      # 累计偏差/中心档命中率
+python skills/pm-weather/scripts/pm_weather.py --date YYYY-MM-DD --mode both --top 10  # 核实目标当地日；费用另核实
+python skills/pm-weather/scripts/pm_weather.py --settle YYYY-MM-DD  # 仅已结束且指定源已发布的当地日
+python skills/pm-weather/scripts/pm_weather.py --bias               # 可信样本诊断，不等于交易胜率
 ```
 
-回答的表长这样（列会随盘面变化）：
+先核实实际时间、城市时区与目标当地日，区分预报发布/有效时刻、观测时间、关盘和结算发布时间。核对市场 ID、YES/NO token 归属、标题与日期；两侧完整 book 排序后计算足额成交 VWAP，不把 shortlist 当全集，完整档位分布另行展示。日期或 ID 不匹配的响应拒用，缺失数据明确报告。
 
-> | 盘面 | 市场 | 档位 | 概率（依据） | 现价可成交 | 等待限价 | 赔率 | 压力后胜率 | 状态 |
+主表样式：
 
-- **概率（依据）** 明确写出来源：集合情景比例、独立基准率、或"无独立估计"。
-- **现价可成交** 是本侧真实 ask 走单均价，且已验证能覆盖计划份数；深度不够会标"深度不足"，不给价格。
-- **等待限价** 是低于现价若干 tick 的被动买单情景，不是报价，也不保证成交。
-- **压力后胜率**（天气 NO）对每个档都施加 ±1.5°C 的全体成员平移；中心落在卖档内的只能观察。
+> | 状态 | 城市·日期·最高/最低·档位 | 方向 | 市场/天气 | 挂单/失效 | 胜率依据 |
 
-两边都遵守：费用必须逐市场核实，未知就只报毛价差；`YES bid + NO ask < 1` 不算锁价。相同二元事件等份两侧足额 ASK 的每份条件净价差为 `1 - YES成交成本 - NO成交成本 - 全部费用`；结算、兑换与执行条件须一致。非原子成交仍有单腿、滑点与结算风险，不称“无风险”。通用发现支持 Polymarket / Kalshi，不代表所有事件类别都有独立概率模型；盘口占比不应升级成“强信号”或胜率。
+- **市场/天气**：本侧真实 ask、bid、价差、容量，以及预报中心/实测；报价附实际时间，部分成交均价不冒充整笔可成交价。
+- **胜率依据**：集合比例、滚动偏差、平滑与压力测试都只是模型情景，不是已验证真实概率；有依据才写范围，无可靠估计就直说，不能从市场 ask 倒造胜率。
+- **挂单/失效**：以真实盘口、tick 与条件价值给有依据的近端限价；远端价须实际历史或连续盘口支持，否则写无触达依据、成交概率未知。价格到达仍重核证据与费用。
+- **状态**：当前可考虑/等待限价条件/不参与，纯观察另列；来源未核实与硬筛未通过不冒充合格项，`--risky` 仅作诊断。
+
+天气与事件合约均逐市场核实费用，未知只报毛值。相同二元事件等份 YES+NO 须两侧足额 ASK、全部费用及结算兑换一致；`YES bid + NO ask < 1` 不算锁价。非原子成交仍有单腿、滑点与结算风险，不称无风险。挂单占比不代表人数、信心或胜率。
+
+天气默认只在本次进程内存中复用数据，结束即释放，不保存下载缓存或研究记录。仅 `--cache-mode disk` 开启外置磁盘缓存（默认上限256MB/168小时）；仅 `--save-records` 保存预测与结算记录，二者独立。显式写盘路径可配置，默认 Windows `%LOCALAPPDATA%/trading-skills/pm-weather/{cache,data}`。pm-liquid盘口仅本轮内存复用；stock仅内存合约表；trade不增加磁盘行情缓存，可用 `--no-options` 跳过期权取数。所有技能收尾清理自己创建的临时产物与后台任务，不关闭用户已有程序、不删除已有记录；安装包不含运行数据。
 
 
 ## trade：一句话出 BTC/ETH 全景
@@ -130,7 +131,7 @@ stock专项离线回归现为28项（含3个真实提示的规则评估，不是
 
 ## English overview
 
-Four read-only research skills for AI assistants: **pm-edge** for weather, count and cultural prediction markets, **pm-liquid** for liquidity-first event contracts on Polymarket / Kalshi, **trade** for crypto market structure and options candidates, and **stock** for Gate stock-linked USDT perpetuals. No automated orders, account keys or profit guarantees.
+Four read-only research skills for AI assistants: **pm-weather** for weather prediction markets, prioritizing daily high/low temperature bins (other weather events are researched on demand, not promised dedicated model support), **pm-liquid** for liquidity-first event contracts on Polymarket / Kalshi, **trade** for crypto market structure and options candidates, and **stock** for Gate stock-linked USDT perpetuals. No automated orders, account keys or profit guarantees.
 
 Copy the desired `skills/<name>` directory into your client's supported skills directory; avoid duplicate names. CLI scripts require Python 3.10+ and use the standard library. Run commands above from the repository root and check each script's `--help`. Dates are local to the contract, not necessarily your computer.
 

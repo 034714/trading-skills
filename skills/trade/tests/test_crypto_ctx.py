@@ -166,6 +166,47 @@ class RegressionTests(unittest.TestCase):
                     self.assertGreater(card["units_per_100_usd_risk_example"], 0)
                 self.assertEqual(err, "")
 
+    def test_no_options_skips_chain_but_preserves_market_context(self):
+        with patch.object(ctx, "klines", side_effect=self.history), \
+             patch.object(ctx, "option_chain", side_effect=AssertionError("must not fetch")) as chain, \
+             patch.object(ctx, "fetch_live", return_value={"spot": 101}):
+            code, out, err = self.invoke(["--no-options", "--auto", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        chain.assert_not_called()
+        report = json.loads(out)
+        for symbol in report["symbols"]:
+            self.assertEqual(symbol["options_status"], "skipped_by_request")
+            self.assertEqual(symbol["option_candidates"], [])
+            self.assertNotIn("atm_iv_nearest_expiry_pct", symbol)
+            self.assertIn("skipped", symbol["options_fit_note"])
+            self.assertEqual(symbol["live_snapshot"]["spot"], 101)
+            self.assertIn("multi_timeframe", symbol)
+            self.assertEqual(symbol["conditional_order_card"]["bias"], "long")
+
+    def test_default_still_fetches_options(self):
+        with patch.object(ctx, "klines", side_effect=self.history), \
+             patch.object(ctx, "option_chain", return_value=[]) as chain, \
+             patch.object(ctx, "fetch_live", return_value={}):
+            code, out, _ = self.invoke(["--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(call.args[0] for call in chain.call_args_list), ["BTC", "ETH"])
+        self.assertTrue(all(s["options_status"] == "no_expiry_in_range" for s in json.loads(out)["symbols"]))
+
+    def test_no_options_rejects_explicit_expiry_before_network(self):
+        with patch.object(ctx, "get", side_effect=AssertionError("must not fetch")) as request:
+            code, out, _ = self.invoke(["--no-options", "--expiry-hint", "10JAN30", "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot be combined", json.loads(out)["error"])
+        request.assert_not_called()
+
+    def test_no_options_does_not_hide_market_failure(self):
+        with patch.object(ctx, "klines", side_effect=OSError("offline")), \
+             patch.object(ctx, "option_chain") as chain:
+            code, out, _ = self.invoke(["--no-options", "--json"])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out)["status"], "no_plan")
+        chain.assert_not_called()
+
     def test_text_starts_with_card(self):
         with patch.object(ctx, "klines", side_effect=self.history), \
              patch.object(ctx, "option_chain", return_value=[]), \
