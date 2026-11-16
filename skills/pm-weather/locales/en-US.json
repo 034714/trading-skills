@@ -1,1 +1,4 @@
-{"displayName":"Weather Prediction Market Research","brief":"Temperature-first, read-only research: verify local dates, settlement stations, YES/NO books and weather evidence before conditional plans. Other weather events are researched on demand, not promised model support."}
+{
+  "displayName": "Weather Prediction Market Research",
+  "brief": "Explicit selection or naming required; related topics alone do not invoke this skill. Temperature-first, read-only research: verify local dates, settlement stations, YES/NO books and weather evidence before conditional plans. Other weather events are researched on demand, not promised model support."
+}

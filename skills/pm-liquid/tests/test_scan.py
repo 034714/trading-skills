@@ -7,6 +7,86 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import scan  # noqa: E402
 
 
+def test_kalshi_markets_cursor_and_total_cap(monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+    calls = []
+    def fetch(url):
+        query = parse_qs(urlsplit(url).query)
+        calls.append(query)
+        if len(calls) == 1:
+            return {"markets": [{"ticker": str(i)} for i in range(100)],
+                    "cursor": "next/+="}
+        return {"markets": [{"ticker": "101"}, {"ticker": "102"}],
+                "cursor": "more"}
+    monkeypatch.setattr(scan, "http_json", fetch)
+    rows, error = scan._ka_markets("BTC & test", 102)
+    assert error is None and len(rows) == 102 and len(calls) == 2
+    assert calls[0]["limit"] == ["100"] and calls[1]["limit"] == ["2"]
+    assert calls[1]["cursor"] == ["next/+="]
+    assert calls[0]["series_ticker"] == ["BTC & test"]
+    assert all(row["_sampled_at"] for row in rows)
+
+
+def test_kalshi_markets_stops_without_cursor_and_zero_cap(monkeypatch):
+    calls = []
+    def fetch(url):
+        calls.append(url)
+        return {"markets": [{"ticker": "one"}]}
+    monkeypatch.setattr(scan, "http_json", fetch)
+    assert scan._ka_markets("BTC", 0) == ([], None)
+    assert not calls
+    assert len(scan._ka_markets("BTC", 200)[0]) == 1
+    assert len(calls) == 1
+
+
+def test_kalshi_markets_repeated_cursor_and_later_error(monkeypatch):
+    calls = []
+    def fetch(url):
+        calls.append(url)
+        return {"markets": [], "cursor": "same"}
+    monkeypatch.setattr(scan, "http_json", fetch)
+    rows, error = scan._ka_markets("BTC", 200)
+    assert rows is None and "repeated markets cursor" in error
+    assert len(calls) == 2
+    def failed(url):
+        if "cursor=" in url:
+            raise scan.FetchError("page two offline")
+        return {"markets": [{"ticker": "one"}], "cursor": "two"}
+    monkeypatch.setattr(scan, "http_json", failed)
+    assert scan._ka_markets("BTC", 200) == (None, "series BTC: page two offline")
+
+
+def test_kalshi_markets_hard_page_bound(monkeypatch):
+    calls = []
+    def fetch(url):
+        calls.append(url)
+        return {"markets": [], "cursor": str(len(calls))}
+    monkeypatch.setattr(scan, "http_json", fetch)
+    rows, error = scan._ka_markets("BTC", 10000)
+    assert rows is None and "page bound reached" in error
+    assert len(calls) == 10
+
+
+def test_untruncated_market_rules(monkeypatch):
+    long_rules = "rule " * 200
+    market = _pm_market("rules", "rules")
+    market["description"] = long_rules
+    monkeypatch.setattr(scan, "events_by_tag", lambda *a: [{"markets": [market]}])
+    monkeypatch.setattr(scan, "yes_book", lambda token: ([(.48, 30)], [(.5, 30)]))
+    rows, _ = scan.polymarket_rows(["sports"], 12, 1, .05, False)
+    assert rows[0]["rules"] == long_rules
+    def fetch(url):
+        if "/events?" in url:
+            return {"events": []}
+        return {"markets": [{"ticker": "rules", "title": "rules",
+                 "yes_bid_dollars": ".48", "yes_ask_dollars": ".5",
+                 "yes_ask_size_fp": "30", "rules_primary": long_rules,
+                 "rules_secondary": "secondary"}]}
+    monkeypatch.setattr(scan, "http_json", fetch)
+    rows, _ = scan.kalshi_rows(["series"], 200, .05, False)
+    assert rows[0]["rules"] == long_rules + "\n\nsecondary"
+
+
 def test_csv():
     assert scan.csv("a, b ,c") == ["a", "b", "c"]
     assert scan.csv("") == []

@@ -5,7 +5,22 @@ from __future__ import annotations
 import json
 import math
 import re
+import ssl
+import threading
 import time
+
+_TLS_CONTEXT = None
+_TLS_LOCK = threading.Lock()
+
+
+def tls_context():
+    """Load the Windows trust store once, not once per concurrent book request."""
+    global _TLS_CONTEXT
+    with _TLS_LOCK:
+        if _TLS_CONTEXT is None:
+            _TLS_CONTEXT = ssl.create_default_context()
+        return _TLS_CONTEXT
+
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,7 +38,37 @@ MONTHS = {m: i for i, m in enumerate(
 
 
 class FetchError(RuntimeError):
-    pass
+    """Legacy message-only calls remain valid; transport callers add metadata."""
+    def __init__(self, message, *, status=None, retryable=True):
+        super().__init__(message)
+        self.status = status
+        self.retryable = retryable
+
+
+def fetch_error(exc, url):
+    """Bounded, allowlisted diagnostics: never echo body, headers, path or query.
+
+    Server bodies/reasons and network exception strings can reflect credentials.
+    Keep only a validated hostname and a local category, rather than attempting
+    to blacklist every possible secret spelling in untrusted text.
+    """
+    if isinstance(exc, FetchError):
+        return exc
+    host = urllib.parse.urlsplit(url).hostname or "unknown"
+    host = re.sub(r"[^a-zA-Z0-9.:-]", "_", host)[:96]
+    status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if status is not None:
+        category = f"HTTP {status}"
+        retryable = status == 429 or 500 <= status <= 599
+    elif isinstance(reason, ssl.SSLError):
+        category, retryable = "TLS verification/handshake failed", False
+    elif isinstance(exc, (UnicodeDecodeError, json.JSONDecodeError)):
+        category, retryable = "invalid JSON", False
+    else:
+        category, retryable = "network/read error", True
+    return FetchError(f"{category} from {host}"[:160],
+                      status=status, retryable=retryable)
 
 
 def check_url(url: str) -> str:
@@ -46,27 +91,21 @@ def check_url(url: str) -> str:
 
 def http_json(url: str, timeout: float = 35.0, attempts: int = 3):
     check_url(url)
-    last = None
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
     for attempt in range(attempts):
         req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout, context=tls_context()) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            if exc.code in (429, 500, 502, 503) and attempt + 1 < attempts:
-                last = FetchError(f"HTTP {exc.code} for {url}")
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            raise FetchError(f"HTTP {exc.code} for {url}") from exc
-        except (urllib.error.URLError, OSError) as exc:
-            last = FetchError(f"network error for {url}: {exc}")
-            if attempt + 1 < attempts:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            raise last from exc
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise FetchError(f"invalid JSON from {url}: {exc}") from exc
-    raise last or FetchError(f"failed to fetch {url}")
+        except (urllib.error.URLError, OSError, UnicodeDecodeError,
+                json.JSONDecodeError) as exc:
+            error = fetch_error(exc, url)
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
+            if not error.retryable or attempt + 1 == attempts:
+                raise error from None
+            time.sleep(1.5 * (attempt + 1))
 
 
 def as_float(value):

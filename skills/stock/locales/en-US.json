@@ -1,4 +1,4 @@
 {
   "displayName": "Gate Stock-Perp Conditional Research",
-  "brief": "Read-only Gate stock-perp research: discover tradable contracts, per-contract funding intervals, daily/4H/1H context and source times; manual online news/macro/earnings verification, separate structural and gross-R targets, holding horizons and expiry. No orders."
+  "brief": "Explicit selection or naming required; related topics alone do not invoke this skill. Read-only Gate stock-perp research: discover tradable contracts, per-contract funding intervals, daily/4H/1H context and source times; manual online news/macro/earnings verification, separate structural and gross-R targets, holding horizons and expiry. No orders."
 }

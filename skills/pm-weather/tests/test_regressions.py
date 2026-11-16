@@ -296,6 +296,22 @@ class PlausibleCandidateGate(unittest.TestCase):
                "p_min": 0.0, "p_max": 0.10, "p_calibrated": 0.095}
         self.assertIn(row, pm_weather.plausible_candidates([row]))
 
+    def test_model_near_market_not_fetched(self):
+        import pm_weather
+        # Model only 1c above ask: cannot reach the 4pp candidate threshold, so
+        # the book pass must skip it. The old `> -tol` gate kept brackets like
+        # this, pulling ~388 brackets across 82 events into the slow book pass.
+        row = {"label": "16°C", "ask": 0.19, "bid": 0.18,
+               "p_min": 0.05, "p_max": 0.30, "p_calibrated": 0.20}
+        self.assertNotIn(row, pm_weather.plausible_candidates([row]))
+
+    def test_min_edge_override(self):
+        import pm_weather
+        # With a lower min_edge the same near-market bracket becomes plausible.
+        row = {"label": "16°C", "ask": 0.19, "bid": 0.18,
+               "p_min": 0.05, "p_max": 0.30, "p_calibrated": 0.20}
+        self.assertIn(row, pm_weather.plausible_candidates([row], min_edge=0.01))
+
 
 class PrewarmBudget(unittest.TestCase):
     """A degraded IEM link drops multi-MB reads (IncompleteRead), so the per-read

@@ -244,7 +244,7 @@ def polymarket_rows(tags, per_tag, keep, max_spread, tail, query=""):
             "fee_rate": rate, "fee": fee_txt,
             "vol24h": vol, "liquidity": as_float(mk.get("liquidity")) or 0.0,
             "close": mk.get("endDate") or ev.get("endDate"),
-            "rules": (mk.get("description") or ev.get("description") or "")[:400],
+            "rules": (mk.get("description") or ev.get("description") or ""),
             "id": mk.get("id"), "tail": tail, "vol_unit": "$",
         })
     # NO-side books are the expensive half: fetch them only for the best few.
@@ -287,12 +287,32 @@ def kalshi_book(ticker, shares, *, strict=False):
 
 
 def _ka_markets(s: str, per_series: int):
-    mk_url = (f"{KALSHI}/markets?status=open&limit={per_series}"
-              f"&mve_filter=exclude&series_ticker={urllib.parse.quote(s)}")
+    """Cursor pagination with an explicit total cap (not a completeness claim)."""
     def fetch():
-        markets = http_json(mk_url).get("markets") or []
-        sampled_at = utc_now()
-        return [dict(m, _sampled_at=sampled_at) for m in markets]
+        markets, cursor, cursors = [], None, set()
+        # Keep requests bounded even if a server repeats cursors or returns no rows.
+        for _ in range(10):
+            remaining = max(0, per_series) - len(markets)
+            if remaining <= 0:
+                break
+            params = {"status": "open", "limit": min(100, remaining),
+                      "mve_filter": "exclude", "series_ticker": s}
+            if cursor:
+                params["cursor"] = cursor
+            data = http_json(f"{KALSHI}/markets?{urllib.parse.urlencode(params)}")
+            sampled_at = utc_now()
+            markets.extend(dict(m, _sampled_at=sampled_at)
+                           for m in (data.get("markets") or [])[:remaining])
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+            if cursor in cursors:
+                raise FetchError("repeated markets cursor; coverage incomplete")
+            cursors.add(cursor)
+        else:
+            if cursor and len(markets) < max(0, per_series):
+                raise FetchError("markets page bound reached; coverage incomplete")
+        return markets
     return _safe(fetch, f"series {s}")
 
 
@@ -360,7 +380,8 @@ def kalshi_rows(series, per_series, max_spread, tail, books=12, query=""):
                 "vol24h": fnum(mk.get("volume_24h_fp")) or 0.0,
                 "liquidity": fnum(mk.get("open_interest_fp")) or 0.0,
                 "close": close,
-                "rules": (mk.get("rules_primary") or "")[:400],
+                "rules": "\n\n".join(filter(None, (mk.get("rules_primary"),
+                                                     mk.get("rules_secondary")))),
                 "id": mk.get("ticker"), "tail": tail, "series": s, "vol_unit": "份",
             })
     short = [r for r in out if band_ok(r["yes_ask"], tail)
@@ -479,7 +500,8 @@ def main():
     ap.add_argument("--keep", type=int, default=8, help="Polymarket markets to YES-book-check")
     ap.add_argument("--no-books", type=int, default=4, help="NO-side books to fetch (top by volume)")
     ap.add_argument("--per-tag", type=int, default=12)
-    ap.add_argument("--per-series", type=int, default=40)
+    ap.add_argument("--per-series", type=int, default=200,
+                    help="Kalshi markets total cap per series (cursor pages <=100; max 10 pages)")
     ap.add_argument("--tail", action="store_true", help="allow <10c / >90c (high-odds mode)")
     ap.add_argument("--no-x", action="store_true", help="skip cross-platform matching")
     ap.add_argument("--json", action="store_true")

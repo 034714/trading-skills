@@ -17,6 +17,33 @@ def event(code="KLGA", ident=1):
                 markets=[dict(groupItemTitle="20°C")])
 
 
+def test_book_retry_has_one_owner_and_checks_identity(monkeypatch):
+    calls = []
+    def fetch(url, **kwargs):
+        calls.append(kwargs)
+        raise w.FetchError("offline")
+    monkeypatch.setattr(w, "http_json", fetch)
+    monkeypatch.setattr(w.time, "sleep", lambda _: None)
+    import pytest
+    with pytest.raises(w.FetchError):
+        w.book("123", attempts=2)
+    assert calls == [{"timeout": 10.0, "attempts": 1}] * 2
+    monkeypatch.setattr(w, "http_json", lambda *a, **k: {"asset_id": "wrong"})
+    with pytest.raises(w.FetchError, match="asset_id mismatch"):
+        w.book("123", attempts=1)
+
+
+def test_shared_tls_context_loaded_once(monkeypatch):
+    import pm_common as common
+    made = []
+    monkeypatch.setattr(common, "_TLS_CONTEXT", None)
+    monkeypatch.setattr(common.ssl, "create_default_context", lambda: made.append(object()) or made[-1])
+    with w.ThreadPoolExecutor(max_workers=4) as pool:
+        contexts = list(pool.map(lambda _: common.tls_context(), range(12)))
+    assert len(made) == 1
+    assert all(c is contexts[0] for c in contexts)
+
+
 def test_local_day_boundary():
     now = datetime(2026, 1, 2, 1, tzinfo=timezone.utc)
     assert not w.local_day_finished(date(2026, 1, 1), "KLGA", now)

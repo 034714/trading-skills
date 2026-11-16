@@ -7,6 +7,18 @@
 - **trade**：BTC / ETH（可扩展到其他币）技术与期权研究；一条命令带现价、资金费率、OI、多空比快照、1H/4H 日内背景与山寨币筛选；回复第一句就给「现在做什么」的大白话结论；区分行情快照、模型假设和可执行条件，不把指标或历史波动率比较直接当作买卖信号。
 - **stock**：Gate 股票类 USDT 永续（美股/港股/指数/未上市 AI 公司）条件研究；无默认标的，`--list` 查合约；一条命令带执行层快照（标记价 vs 指数锚溢价、按合约周期资金费、OI、多空账户数）、Yahoo 底层指标、1H 日内背景与美股时段状态；单一场所与财报未核查照直说。
 
+## 调用方式：四个技能都需明确点名
+
+通过客户端技能菜单选择、附技能链接，或明确写出 `/pm-weather`、`/pm-liquid`、`/trade`、`/stock` 后才使用对应技能；`@名称` 也可表达点名意图，实际入口以客户端为准。明确继续当前已选择的技能任务也可以。普通聊天提到天气、BTC、股票或体育，不自动加载技能正文或执行脚本；跨领域问题只说明适用技能，不自动切换。
+
+这是给模型的调用约定，不是客户端强制的访问隔离。ZCode 仍可展示技能名称与简短说明，不保证隐藏摘要；不使用当前未支持的 manual-only 配置字段。更新后请刷新技能列表或新开会话，已加载的正文不会从当前上下文自动消失。
+
+## 表达风格
+
+两个预测市场 skill 默认先说人话：第一段回答“有没有值得挂的单”，随后给一张简表，写清买什么、吃价或挂价、获胜时盈利空间，并在紧邻备注给报价时间、费用状态与撤销条件。天气并列市场与预报中心，模型只作参考；不把市场价格当真实胜率，也不猜测交易者究竟依据哪种模型定价。20 份仅为执行容量核验示例，不是建议仓位；没有合格单就说明具体缺口，不为凑表编价格。
+
+首次出现的术语会翻译成中文：YES/NO、bid/ask、价差、VWAP、longshot、maker/taker；Kalshi 指美国 CFTC 监管的预测市场交易所（美元计价、每份 $1），Polymarket 是加密 USDC 计价的预测市场，两者不是同一家。完整档位、压力情景、规则正文和费用公式只在用户追问或需要留证时展开；研究口径与风险边界不变。
+
 ## 安装
 
 天气技能目录已改名为 `skills/pm-weather`。新名称安装包须实际发布后再下载，旧 Release 的 `pm-edge.zip` 不因此自动更名。安装请使用独立实体目录，不要建立指向开发项目的快捷方式或目录联接：删除开发仓库不应影响已安装技能。更新时重新导入，或按核对过的正式文件清单同步；安装副本不会自动跟随仓库修改。
@@ -21,6 +33,7 @@
 
 - `/pm-weather 扫描明天的天气盘，看看有没有值得做的。`
 - `/pm-weather 只看纽约、东京、香港，稳健但也要有合理赚头。`
+- `/pm-weather 北京为什么押 7°C 最多？直接告诉我挂哪、挂多少。`
 - `/pm-liquid 这周有什么流动性好的热门事件合约值得看？不看天气。`
 - `/pm-liquid 扫一下今晚和这周的深盘，优先能挂单的。`
 - `/pm-liquid 湖人这场两边盘口怎么样？能不能挂限价？`
@@ -35,7 +48,7 @@
 `pm-liquid` 只做“当下真的能成交”的盘：默认扫体育、宏观数据、政治、金融，读两侧真实 ask/bid、20 份完整成交、费用与收盘时间；24h 成交只作参考（Kalshi 按 $1 名义、串关膨胀；临开赛/刚结束都会失真）。默认不主动买 <10¢、不追 >90¢，入场默认挂被动限价。
 
 ```bash
-python skills/pm-liquid/scripts/scan.py --top 8                 # both，首次约 40s，缓存命中约 20s
+python skills/pm-liquid/scripts/scan.py --top 8                 # 双平台；耗时随接口与范围变化
 python skills/pm-liquid/scripts/scan.py --query "Lakers"        # 指定事件同轮读两边
 python skills/pm-liquid/scripts/scan.py --tail                  # 高赔率模式，放开 10–90c
 python skills/pm-liquid/scripts/scan.py --platform kalshi --series KXCPI,KXPAYROLLS,KXFED
@@ -45,7 +58,7 @@ python skills/pm-liquid/scripts/scan.py --platform kalshi --series KXCPI,KXPAYRO
 
 ## pm-weather：温度盘优先的天气研究
 
-`pm-weather` 专注天气，优先最高温、最低温与逐日温度档位；降水、风速等仅按需核实规则、数据与证据，不承诺已有专用模型或自动扫描支持。非天气事件不属本 skill：体育、宏观、政治、加密价格等流动性合约转 `pm-liquid` 的已有流程；推文、奖项、票房不再由天气 skill 承接，也不据此承诺其他 skill 有专用模型。现有通用脚本保留。
+`pm-weather` 专注天气，优先最高温、最低温与逐日温度档位；降水、风速等仅按需核实规则、数据与证据，不承诺已有专用模型或自动扫描支持。非天气事件不属本 skill：体育、宏观、政治、加密价格等流动性合约可明确选择 `pm-liquid`，不自动转用；推文、奖项、票房不再由天气 skill 承接，也不据此承诺其他 skill 有专用模型。现有通用脚本保留。
 
 首次没有偏好时只问一个选择题：稳健有赚头（推荐）/均衡/高赔率；已有偏好不重复问，直接扫描或不能交互时默认稳健且重视条件回报，不保证收益。默认展示 3–6 个候选，不是上限，不凑数；按证据稳健性、条件回报、流动性与不确定性安排行序，不另设排序列。
 
@@ -70,12 +83,12 @@ python skills/pm-weather/scripts/pm_weather.py --bias               # 可信样�
 
 天气与事件合约均逐市场核实费用，未知只报毛值。相同二元事件等份 YES+NO 须两侧足额 ASK、全部费用及结算兑换一致；`YES bid + NO ask < 1` 不算锁价。非原子成交仍有单腿、滑点与结算风险，不称无风险。挂单占比不代表人数、信心或胜率。
 
-天气默认只在本次进程内存中复用数据，结束即释放，不保存下载缓存或研究记录。仅 `--cache-mode disk` 开启外置磁盘缓存（默认上限256MB/168小时）；仅 `--save-records` 保存预测与结算记录，二者独立。显式写盘路径可配置，默认 Windows `%LOCALAPPDATA%/trading-skills/pm-weather/{cache,data}`。pm-liquid盘口仅本轮内存复用；stock仅内存合约表；trade不增加磁盘行情缓存，可用 `--no-options` 跳过期权取数。所有技能收尾清理自己创建的临时产物与后台任务，不关闭用户已有程序、不删除已有记录；安装包不含运行数据。
+天气默认只在本次进程内存中复用数据，结束即释放，不保存下载缓存或研究记录。仅 `--cache-mode disk` 开启外置磁盘缓存（默认上限256MB/168小时）；仅 `--save-records` 保存预测与结算记录，二者独立；只有用户明确要求保存推荐时才用 `--log-pick` 写台账，`--review` 只读已有推荐。显式写盘路径可配置，默认 Windows `%LOCALAPPDATA%/trading-skills/pm-weather/{cache,data}`。pm-liquid盘口仅本轮内存复用；stock仅内存合约表；trade不增加磁盘行情缓存，可用 `--no-options` 跳过期权取数。所有技能收尾清理自己创建的临时产物与后台任务，不关闭用户已有程序、不删除已有记录；安装包不含运行数据。
 
 
 ## trade：一句话出 BTC/ETH 全景
 
-问「BTC、ETH 什么结构」，回答开头是一张「现在的位置」快照——现价、已跌破/踩着的关键位、上方面对的阻力、资金费率、多空比、OI、临近事件，一眼看清处境：
+明确调用 `/trade` 问「BTC、ETH 什么结构」时，先给一句话结论，再给一张「现在的位置」快照——现价、已跌破/踩着的关键位、上方面对的阻力、资金费率、多空比、OI、临近事件，一眼看清处境：
 
 <img width="1153" height="751" alt="回答开头的「现在的位置」快照表" src="https://github.com/user-attachments/assets/fdd41015-a990-4821-9278-17de0a653367" />
 
@@ -109,7 +122,7 @@ python skills/stock/scripts/stock_ctx.py --list            # 查可交易的股�
 python skills/stock/scripts/stock_ctx.py --symbols CXMT,NVDA --json   # 双层全景
 ```
 
-无默认推荐名单。未点名时可主动从交易中合约按成交量级、底层与数据完整性筛选，再选最多4个深看；不是固定复查旧持仓。
+无默认推荐名单。已明确调用 `/stock`、但未指定标的时可主动从交易中合约按成交量级、底层与数据完整性筛选，再选最多4个深看；不是固定复查旧持仓。
 
 ```bash
 python -B skills/stock/scripts/stock_ctx.py --list --sort volume --top 12 --underlying-only --json
@@ -117,7 +130,7 @@ python -B skills/stock/scripts/stock_ctx.py --list --sort volume --top 12 --unde
 
 `--list` 已移除前120行硬截断，默认完整输出；可加 `--min-volume`。日线/4H/1H附源K线时间与过期标记，假期/提前收盘仍须查官方日历。新闻、宏观局势与财报采用明确人工联网工作流：官方优先，记录发布/事件/查询时间，事实与解读及情景分开，未查不说无事件。卡片将历史摆点结构目标与算术R目标分列，附触发待确认、持有周期与到期；不保证到价。
 
-stock专项离线回归现为28项（含3个真实提示的规则评估，不是fresh会话模型评测）；pm-liquid 离线回归 9 项。
+各技能离线测试独立运行，数量以当前测试输出为准。文本规则检查不等于 fresh-session 模型行为评测。
 
 ## 重要边界
 
@@ -133,9 +146,27 @@ stock专项离线回归现为28项（含3个真实提示的规则评估，不是
 
 Four read-only research skills for AI assistants: **pm-weather** for weather prediction markets, prioritizing daily high/low temperature bins (other weather events are researched on demand, not promised dedicated model support), **pm-liquid** for liquidity-first event contracts on Polymarket / Kalshi, **trade** for crypto market structure and options candidates, and **stock** for Gate stock-linked USDT perpetuals. No automated orders, account keys or profit guarantees.
 
+All four skills require explicit user selection or naming, or an explicit continuation of an already selected task. Related topics alone must not trigger loading or scripts; cross-skill suggestions do not authorize invocation. This is a model instruction, not enforced client isolation: names and summaries may remain visible.
+
 Copy the desired `skills/<name>` directory into your client's supported skills directory; avoid duplicate names. CLI scripts require Python 3.10+ and use the standard library. Run commands above from the repository root and check each script's `--help`. Dates are local to the contract, not necessarily your computer.
 
 Quotes are snapshots, not live instructions. Verify timestamps, executable depth, fees and settlement rules. Stock news, macro events, earnings, holidays and early closes require manual verification; “not checked” never means “no event”. Weather ensemble proportions are model scenarios, not measured probabilities. Equal-size YES+NO pairing uses both executable asks plus all costs, not a bid/ask mix, and is not risk-free. IV versus historical RV is descriptive, not a mispricing or selling signal.
+
+## 验证与发布
+
+四套离线测试需独立进程运行，避免同名模块混用：
+
+```bash
+python -B -m pytest -p no:cacheprovider skills/pm-weather/tests -q
+python -B -m pytest -p no:cacheprovider skills/pm-liquid/tests -q
+python -B -m pytest -p no:cacheprovider skills/trade/tests -q
+python -B -m pytest -p no:cacheprovider skills/stock/tests -q
+python -B -m pytest -p no:cacheprovider tests -q
+```
+
+正式安装包从确定的 Git 提交构建，排除运行数据与缓存；包内有技能目录及其 `SKILL.md`。构建命令：`python -B tools/build_release.py --commit HEAD --output <新的空目录>`。Release 附四个 ZIP、文件清单和 SHA256 校验值。
+
+接口拒绝（如 HTTP 406）属于取数失败，不代表没有市场机会；错误诊断改善不等于已解决访问限制，不使用旧报价冒充当前盘口。
 
 ## 验证范围
 
